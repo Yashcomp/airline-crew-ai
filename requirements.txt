@@ -1,0 +1,2 @@
+streamlit==1.37.1
+pulp==2.9.0

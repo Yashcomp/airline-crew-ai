@@ -1,0 +1,13 @@
+Crew_ID,Name,Rank,Role,Current_Duty_Hours,Rolling_7_Day_Hours,Consecutive_Night_Shifts,Rest_Status,Cost_Multiplier
+CRW001,Arjun Mehta,Captain,Captain,8.0,28.0,1,Legal,1.0
+CRW002,Nisha Rao,Captain,Captain,10.5,33.0,2,Legal,1.5
+CRW003,Elina Verma,Captain,Captain,11.2,36.0,0,Legal,1.0
+CRW004,Omar Khan,FO,FO,7.0,30.0,1,Legal,1.0
+CRW005,Priya Sethi,FO,FO,11.0,34.0,2,Legal,1.5
+CRW006,Hasan Patel,FO,FO,6.0,20.0,1,Illegal,1.0
+CRW007,Ritu Nair,CabinCrew,CabinCrew,5.0,18.0,0,Legal,1.0
+CRW008,Tara Singh,CabinCrew,CabinCrew,9.5,31.0,1,Legal,1.0
+CRW009,Imran Ali,CabinCrew,CabinCrew,11.2,29.0,1,Legal,1.5
+CRW010,Kavya Bose,GroundStaff,GroundStaff,4.0,16.0,0,Legal,1.0
+CRW011,Sameer Malik,GroundStaff,GroundStaff,8.5,24.0,1,Legal,1.5
+CRW012,John D'Souza,GroundStaff,GroundStaff,13.0,40.0,2,Illegal,1.0
