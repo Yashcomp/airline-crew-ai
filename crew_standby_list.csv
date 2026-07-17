@@ -1,13 +1,24 @@
-Crew_ID,Name,Rank,Role,Current_Duty_Hours,Rolling_7_Day_Hours,Consecutive_Night_Shifts,Rest_Status,Cost_Multiplier
-CRW001,Arjun Mehta,Captain,Captain,8.0,28.0,1,Legal,1.0
-CRW002,Nisha Rao,Captain,Captain,10.5,33.0,2,Legal,1.5
-CRW003,Elina Verma,Captain,Captain,11.2,36.0,0,Legal,1.0
-CRW004,Omar Khan,FO,FO,7.0,30.0,1,Legal,1.0
-CRW005,Priya Sethi,FO,FO,11.0,34.0,2,Legal,1.5
-CRW006,Hasan Patel,FO,FO,6.0,20.0,1,Illegal,1.0
-CRW007,Ritu Nair,CabinCrew,CabinCrew,5.0,18.0,0,Legal,1.0
-CRW008,Tara Singh,CabinCrew,CabinCrew,9.5,31.0,1,Legal,1.0
-CRW009,Imran Ali,CabinCrew,CabinCrew,11.2,29.0,1,Legal,1.5
-CRW010,Kavya Bose,GroundStaff,GroundStaff,4.0,16.0,0,Legal,1.0
-CRW011,Sameer Malik,GroundStaff,GroundStaff,8.5,24.0,1,Legal,1.5
-CRW012,John D'Souza,GroundStaff,GroundStaff,13.0,40.0,2,Illegal,1.0
+crew_id,name,role,current_duty_hours,rolling_7_day_hours,consecutive_night_shifts,rest_status,base_cost,overtime_multiplier,qualifications,base_airport,seniority,hours_flown_30_days,days_since_rest,consecutive_days_on
+CRW001,Arjun Mehta,Captain,8.0,28.0,1,Legal,120.0,1.5,"B737;A320",DEL,1,82.0,1,4
+CRW002,Nisha Rao,Captain,10.5,33.0,2,Legal,130.0,1.6,"B737",BOM,2,88.0,1,5
+CRW003,Elina Verma,Captain,11.2,36.0,0,Legal,110.0,1.4,"A320;A321",DEL,3,91.0,0,3
+CRW004,Omar Khan,FO,7.0,30.0,1,Legal,100.0,1.5,"B737;A320",DEL,1,75.0,1,4
+CRW005,Priya Sethi,FO,11.0,34.0,2,Legal,115.0,1.7,"B737",BOM,2,85.0,1,5
+CRW006,Hasan Patel,FO,6.0,20.0,1,Illegal,95.0,1.4,"A320",CCU,3,55.0,2,2
+CRW007,Ritu Nair,CabinCrew,5.0,18.0,0,Legal,60.0,1.3,"B737;A320",DEL,1,48.0,0,3
+CRW008,Tara Singh,CabinCrew,9.5,31.0,1,Legal,62.0,1.4,"B737",BOM,2,78.0,1,4
+CRW009,Imran Ali,CabinCrew,13.5,44.0,3,Legal,70.0,1.8,"A320",DEL,3,95.0,1,6
+CRW010,Kavya Bose,GroundStaff,4.0,16.0,0,Legal,80.0,2.0,"N/A",CCU,1,38.0,0,2
+CRW011,Sameer Malik,GroundStaff,8.5,24.0,1,Legal,150.0,2.5,"N/A",DEL,2,62.0,1,4
+CRW012,John D'Souza,GroundStaff,9.7,26.0,0,Illegal,140.0,2.2,"N/A",BOM,3,68.0,2,3
+CRW013,Priya Sharma,CabinCrew,0.0,12.0,0,Legal,50.0,1.2,"B737;A320;A321",DEL,1,22.0,0,0
+CRW014,Neha Gupta,CabinCrew,8.0,33.0,1,Legal,55.0,1.3,"B737",BOM,2,76.0,1,4
+CRW015,Aisha Patel,CabinCrew,0.0,5.0,0,Legal,45.0,1.2,"A320",DEL,1,12.0,0,0
+CRW016,Rohan Singh,CabinCrew,5.0,25.0,0,Legal,50.0,1.3,"B737;A320",CCU,2,58.0,0,3
+CRW017,Kavita Reddy,CabinCrew,11.0,39.0,2,Rest_Required,60.0,1.5,"B737",DEL,3,88.0,2,5
+CRW018,Sneha Iyer,CabinCrew,0.0,0.0,0,Legal,45.0,1.2,"A320",BOM,1,5.0,0,0
+CRW019,Vikram Desai,CabinCrew,3.0,18.0,1,Legal,50.0,1.3,"B737;A320",DEL,1,42.0,1,2
+CRW020,Ananya Rao,CabinCrew,9.0,36.0,2,Rest_Required,55.0,1.5,"A320",BOM,2,82.0,2,5
+CRW021,Meera Nair,CabinCrew,2.0,10.0,0,Legal,45.0,1.2,"B737",DEL,1,28.0,0,1
+CRW022,Siddharth Menon,CabinCrew,7.0,28.0,0,Legal,50.0,1.3,"A320;A321",CCU,2,65.0,0,3
+CRW023,Test Pilot,Captain,0,0,0,Legal,150.0,1.0,B737;A320,DEL,0,0,0,0
