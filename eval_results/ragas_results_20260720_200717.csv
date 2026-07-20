@@ -1,0 +1,8 @@
+question,response_preview,reference_preview,faithfulness,context_recall,context_precision
+What is the maximum flight duty period for a two-pilot operation?,The maximum flight duty period for a two-pilot operation (8 hrs) is 11:00 landings. For operations e,"For a two-pilot operation, the maximum flight duty period depends on the number of sectors and time ",0.250,0.500,0.750
+How many hours of rest are required before a flight duty period?,The context provided does not specify a minimum number of hours of rest required before a flight dut,The minimum rest before a flight duty period is the greater of: (a) as long as the preceding duty pe,0.500,1.000,0.750
+What is the maximum cumulative flight time allowed in 7 consecutive days?,"The maximum cumulative flight time allowed in 7 consecutive days is 35 hours, according to clause [4",The maximum cumulative flight time in 7 consecutive days is 35 hours.,0.250,0.500,0.750
+What is the definition of flight duty period according to DGCA?,"According to the context provided in guide.pdf, the definition of a flight duty period (FDP) is:
+
+A ",Flight Duty Period (FDP) is a period intended to cover continuous duty that always includes a flight,0.250,0.500,0.750
+What is the maximum number of landings allowed in a two-pilot FDP?,"Based on the provided context, there is no specific information regarding the maximum number of land","The maximum number of landings in a two-pilot FDP is 4 sectors for standard operations, 3 sectors fo",0.250,0.000,0.750

@@ -1,0 +1,2 @@
+question,response_preview,reference_preview,faithfulness,context_recall,context_precision
+What is the maximum flight duty period for a two-pilot operation?,"For a two-pilot (2 crew) operation, the maximum flight duty period (FDP) in any 24-hour period is 18","For a two-pilot operation, the maximum flight duty period depends on the number of sectors and time ",0.500,0.000,0.200

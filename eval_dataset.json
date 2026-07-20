@@ -1,0 +1,257 @@
+[
+  {
+    "user_input": "What is the maximum flight duty period for a two-pilot operation?",
+    "reference": "For a two-pilot operation, the maximum flight duty period depends on the number of sectors and time of day. For 1-2 sectors it is 8-14 hours, for 3 sectors it is 10-12 hours, and for 4 sectors it is 10-11 hours, depending on acclimatization and night duty encroachment.",
+    "reference_contexts": ["The maximum flight time and maximum flight duty period during any 24 hours are indicated in Table 6.1 of the CAR. For two pilot operations, the FDP varies based on number of sectors and acclimatization status."]
+  },
+  {
+    "user_input": "How many hours of rest are required before a flight duty period?",
+    "reference": "The minimum rest before a flight duty period is the greater of: (a) as long as the preceding duty period, or (b) 12 hours, or 18 hours for crossing 3-7 time zones, or 36 hours for crossing more than 7 time zones.",
+    "reference_contexts": ["Para 10.1: The minimum rest before undertaking a flight duty period shall be at least as long as the preceding duty period, or 12 hours, or 18 hours for crossing more than 3 up to 7 time zones, or 36 hours for crossing more than 7 time zones, whichever is greater."]
+  },
+  {
+    "user_input": "What is the maximum cumulative flight time allowed in 7 consecutive days?",
+    "reference": "The maximum cumulative flight time in 7 consecutive days is 35 hours.",
+    "reference_contexts": ["Para 8.1: In 7 consecutive days, the maximum cumulative flight time is 35 hours and the maximum cumulative duty period is 60 hours."]
+  },
+  {
+    "user_input": "What is the definition of flight duty period according to DGCA?",
+    "reference": "Flight Duty Period (FDP) is a period intended to cover continuous duty that always includes a flight or series of flights. It commences when a crew member is required to report for duty and finishes at engine(s) off at the end of the last flight.",
+    "reference_contexts": ["Para 3.5.2: Flight Duty Period (FDP) is a period which is intended to cover continuous period of duty that always includes a flight or series of flight for a flight crew member."]
+  },
+  {
+    "user_input": "What is the maximum number of landings allowed in a two-pilot FDP?",
+    "reference": "The maximum number of landings in a two-pilot FDP is 4 sectors for standard operations, 3 sectors for night duty operations, and 4 sectors for operations within acclimatized zone. For cargo operations, the maximum number of landings may be increased to 4.",
+    "reference_contexts": ["Para 6.1: The maximum number of landings varies by sector count and acclimatization. For cargo operations, the maximum may be increased to 4."]
+  },
+  {
+    "user_input": "How long is the weekly rest period required by DGCA?",
+    "reference": "The weekly rest period is a minimum of continuous 48 hours including two local nights, and there shall never be more than 168 hours between the end of one weekly rest period and the start of the next.",
+    "reference_contexts": ["Para 10.6: An operator shall ensure that the minimum weekly rest of continuous 48 hours including two local nights is provided such that there shall never be more than 168 hours between the end of one weekly rest period and the start of the next."]
+  },
+  {
+    "user_input": "What is local night defined as in the DGCA CAR?",
+    "reference": "Local night is a period of 8 hours falling between 2200 hours and 0800 hours local time.",
+    "reference_contexts": ["Para 3.10: Local Night means a period of 8 hours falling between 2200 hours and 0800 hours local time."]
+  },
+  {
+    "user_input": "What is the maximum standby period at the airport?",
+    "reference": "The standby period shall not extend beyond 12 hours. However, a maximum standby at airport (with or without sleeping quarters) shall not exceed 8 hours.",
+    "reference_contexts": ["Para 11.2.1: Standby period shall not extend beyond 12 hours. However, a maximum standby at airport shall not exceed 8 hours."]
+  },
+  {
+    "user_input": "What is the minimum rest period after standby?",
+    "reference": "When any period of standby finishes, 12 hours rest shall be given.",
+    "reference_contexts": ["Para 10.3.1: When any period of standby finishes, 12 hrs rest shall be given."]
+  },
+  {
+    "user_input": "What is the maximum flight time limit in 28 consecutive days?",
+    "reference": "The maximum cumulative flight time in 28 consecutive days is 100 hours.",
+    "reference_contexts": ["Para 8.3: In 28 consecutive days, the maximum cumulative flight time is 100 hours and the maximum cumulative duty period is 190 hours."]
+  },
+  {
+    "user_input": "How does split duty affect the flight duty period?",
+    "reference": "For split duty, if the break is between 3 and 10 hours, the FDP may be extended by a period equal to half the consecutive hours break taken. If the break is less than 3 hours, no extension is permitted. If the break is more than 10 hours, no extension is permitted.",
+    "reference_contexts": ["Para 9: Split duty provisions. Break less than 3 hours gives no extension. Break between 3 and 10 hours allows extension equal to half the break. Break more than 10 hours permits no extension."]
+  },
+  {
+    "user_input": "What are the requirements for ULR operations crew?",
+    "reference": "ULR flights must be operated by no less than 4 pilots, of whom 2 must be pilot-in-command qualified for the route. The duty flight crew must comprise at least 2 pilots with at least one PIC qualified.",
+    "reference_contexts": ["Para 15.4: Each ULR flight is to be operated by no less than four pilots of whom two must be pilot-in-command qualified for the route."]
+  },
+  {
+    "user_input": "What is the rest period required after ULR flights?",
+    "reference": "Flight crew of ULR flights on return to Home Base shall be provided with at least 120 hours free of all duties. This rest period increases by 24 hours after 2 consecutive ULR flights.",
+    "reference_contexts": ["Para 15.5.2: Flight Crew of the ULR Flight on return to Home Base shall be provided with a period of least 120 hours free of all duties."]
+  },
+  {
+    "user_input": "How many consecutive night operations are flight crew allowed?",
+    "reference": "Flight crew shall neither be detailed nor undertake any flight duty between periods embracing 0000 to 0600 hrs local time for more than two consecutive nights except once within a period of 168 hours.",
+    "reference_contexts": ["Para 13.1: Flight crew shall not undertake flight duty between 0000 to 0600 hrs for more than two consecutive nights except once within 168 hours."]
+  },
+  {
+    "user_input": "What extensions are allowed for unforeseen operational circumstances?",
+    "reference": "For unforeseen operational circumstances: Flight Time may be extended by maximum 1 hour, FDP by maximum 2 hours, and only one extra landing may be carried out for diversion. This is subject to cumulative limits of 4 hours flight time and 8 hours FDP during any 28 consecutive days.",
+    "reference_contexts": ["Para 16.1: Flight Time by maximum 1 hour, FDP by maximum 2 hours, one extra landing for diversion. Subject to cumulative limits of 4 hours FT and 8 hours FDP in 28 days."]
+  },
+  {
+    "user_input": "What is the definition of acclimatized according to DGCA?",
+    "reference": "Acclimatized means a state in which a crew member's circadian biological clock is synchronized to the time zone where the crew member is. A crew member is considered acclimatized to a 3-hour wide time zone surrounding the local time at the point of departure.",
+    "reference_contexts": ["Para 3.1: Acclimatized means a state in which a crew member's circadian biological clock is synchronized to the time zone where the crew member is."]
+  },
+  {
+    "user_input": "What is the maximum duty period during any 24 hours?",
+    "reference": "The maximum duty period during any 24 hours shall not be more than one hour beyond the maximum allowable Flight Duty Period.",
+    "reference_contexts": ["Para 6.2: The maximum duty period during any 24 hours shall not be more than one hour beyond maximum allowable Flight Duty Period."]
+  },
+  {
+    "user_input": "What is the minimum in-flight rest period for augmented crew?",
+    "reference": "The minimum in-flight rest period shall be a consecutive 90 minutes period for each crew member and 2 consecutive hours for the flight crew members at control during landing.",
+    "reference_contexts": ["Para 7.2.2: The minimum in-flight rest period shall be a consecutive 90 minutes period for each crew member and 2 consecutive hours for the flight crew members at control during landing."]
+  },
+  {
+    "user_input": "What are the cumulative flight time limits in 365 days?",
+    "reference": "The maximum cumulative flight time in 365 consecutive days is 1000 hours, and the maximum cumulative duty period is 1800 hours.",
+    "reference_contexts": ["Para 8.5: In 365 consecutive days, the maximum cumulative flight time is 1000 hours and the maximum cumulative duty period is 1800 hours."]
+  },
+  {
+    "user_input": "How does night duty affect the maximum FDP?",
+    "reference": "When an FDP starts in the WOCL (0200-0600), the maximum FDP is reduced by 100% of its encroachment up to a maximum of 2 hours. When the FDP ends in or fully encompasses the WOCL, the maximum FDP is reduced by 50% of its encroachment.",
+    "reference_contexts": ["Para 7 Note 2: When FDP starts in WOCL, max FDP reduced by 100% of encroachment up to 2 hours. When FDP ends in or encompasses WOCL, reduced by 50%."]
+  },
+  {
+    "user_input": "What is the maximum cumulative flight time in 14 consecutive days?",
+    "reference": "The maximum cumulative flight time in 14 consecutive days is 65 hours.",
+    "reference_contexts": ["Para 8.2: In 14 consecutive days, the maximum cumulative flight time is 65 hours and the maximum cumulative duty period is 100 hours."]
+  },
+  {
+    "user_input": "What is the minimum rest after return to home base for time zone differences?",
+    "reference": "For time zone differences: crossing more than 3 and up to 7 time zones requires 36 hours rest including 2 local nights. Crossing more than 7 time zones requires 72 hours rest including 3 local nights.",
+    "reference_contexts": ["Para 10.7: Time zone difference more than 3 up to 7 requires 36 hours rest with 2 local nights. More than 7 time zones requires 72 hours rest with 3 local nights."]
+  },
+  {
+    "user_input": "What is the maximum flight time for augmented crew operations?",
+    "reference": "For 3 crew operations, maximum flight time is 12 hours. For 4 crew operations, it is 14 hours. For ULR operations above 14 hours with 4 crew, it is 17 hours.",
+    "reference_contexts": ["Para 7.1: 3 crew operation max flight time 12 hours, 4 crew operation 14 hours, ULR above 14 hours with 4 crew 17 hours."]
+  },
+  {
+    "user_input": "What is the maximum FDP for augmented crew with bunk rest?",
+    "reference": "For 3 crew operation with bunk, maximum FDP is 16 hours. For 4 crew operation with bunk, it is 18 hours. For ULR with 4 crew, it is 21 hours.",
+    "reference_contexts": ["Para 7.1: 3 crew with bunk max FDP 16 hours, 4 crew with bunk 18 hours, ULR 4 crew 21 hours."]
+  },
+  {
+    "user_input": "What is the maximum FDP for augmented crew with isolated rest seat?",
+    "reference": "For 3 crew operation with isolated rest seat, maximum FDP is 15 hours. For 4 crew operation, it is 16 hours.",
+    "reference_contexts": ["Para 7.1: 3 crew with isolated rest seat max FDP 15 hours, 4 crew with isolated rest seat 16 hours."]
+  },
+  {
+    "user_input": "What is the maximum FDP for augmented crew with basic rest seat?",
+    "reference": "For 3 crew operation with basic rest seat, maximum FDP is 14 hours. Basic rest seat is not available for 4 crew operations.",
+    "reference_contexts": ["Para 7.1: 3 crew with basic rest seat max FDP 14 hours. Basic rest seat not available for 4 crew operations."]
+  },
+  {
+    "user_input": "What are the requirements for base training flights?",
+    "reference": "Base training may be conducted with a maximum of up to 18 landings and additional 2 landings for positioning within 11 hours of flight duty time and 6 hours of flying time. If base training encroaches WOCL for all 20 landings, additional rest of 12 hours including one local night is required.",
+    "reference_contexts": ["Para 14.2: Base training max 18+2 landings within 11 hours FDP and 6 hours flying time. WOCL encroachment requires 12 hours additional rest."]
+  },
+  {
+    "user_input": "What is the definition of night duty according to DGCA?",
+    "reference": "Night Duty is any duty period encroaching upon any portion of the time period between 0000 hrs and 0600 hrs in the time zone to which the crew is acclimatized.",
+    "reference_contexts": ["Para 3.11: Night Duty means any Duty Period encroaching upon any portion of the time period between 0000 hrs and 0600 hrs in the time zone to which the crew is acclimatized."]
+  },
+  {
+    "user_input": "What is the maximum duty period for cabin crew?",
+    "reference": "The maximum duty period for cabin crew is 14 hours.",
+    "reference_contexts": ["The maximum duty period for cabin crew is defined in the operator's FDTL scheme as per DGCA CAR Section 7 Series J Part III."]
+  },
+  {
+    "user_input": "What is the maximum rolling 7-day hours for pilots?",
+    "reference": "The maximum rolling 7-day flight hours for pilots is 35 hours.",
+    "reference_contexts": ["Para 8.1: Maximum cumulative flight time in 7 consecutive days is 35 hours."]
+  },
+  {
+    "user_input": "What is the maximum consecutive nights for cabin crew?",
+    "reference": "Cabin crew shall not be detailed for night duty for more than 3 consecutive nights.",
+    "reference_contexts": ["Cabin crew night duty limitations are specified in the operator's FDTL scheme as per DGCA CAR."]
+  },
+  {
+    "user_input": "What is the minimum rest requirement for ground staff?",
+    "reference": "Ground staff require a minimum rest of 10 hours.",
+    "reference_contexts": ["Minimum rest requirements for ground staff are specified in the operator's FDTL scheme."]
+  },
+  {
+    "user_input": "What is the standard duty threshold for pilots before overtime?",
+    "reference": "The standard duty threshold for pilots before overtime kicks in is 10 hours.",
+    "reference_contexts": ["Standard duty thresholds are defined in the operator's FDTL scheme for cost calculation purposes."]
+  },
+  {
+    "user_input": "What is the minimum layover duration required?",
+    "reference": "The minimum layover duration is 600 minutes (10 hours).",
+    "reference_contexts": ["Minimum layover duration is defined in the operator's FDTL scheme as 600 minutes."]
+  },
+  {
+    "user_input": "What documentation must operators maintain for flight crew?",
+    "reference": "Operators must maintain records for 18 months including start, duration and end of each flight duty period, duty period, rest periods, flight time, and cumulative flight time.",
+    "reference_contexts": ["Para 17: Records shall be kept for 18 months of duties performed and rest periods provided."]
+  },
+  {
+    "user_input": "What is the WOCL period defined by DGCA?",
+    "reference": "WOCL (Window of Circadian Low) is the period between 0200h and 0600h in the time zone to which a crew member is acclimatized.",
+    "reference_contexts": ["Para 3.25: WOCL means a period between 0200h and 0600h in the time zone to which a crew member is acclimatized."]
+  },
+  {
+    "user_input": "What are the requirements for fatigue report management?",
+    "reference": "Fatigue reports shall be used as effective tools in identifying and mitigating crew fatigue. Operators shall establish a clear policy on how to raise and respond to fatigue reports. Reports shall follow a non-punitive and confidentiality policy.",
+    "reference_contexts": ["Para 4.10: Fatigue reports shall be used as effective tools. Operators shall establish clear policy. Reports follow non-punitive and confidentiality policy."]
+  },
+  {
+    "user_input": "What is the maximum cumulative duty period in 90 days?",
+    "reference": "The maximum cumulative duty period in 90 consecutive days is 600 hours.",
+    "reference_contexts": ["Para 8.4: In 90 consecutive days, the maximum cumulative flight time is 300 hours and the maximum cumulative duty period is 600 hours."]
+  },
+  {
+    "user_input": "What is the maximum cumulative duty period in 7 days?",
+    "reference": "The maximum cumulative duty period in 7 consecutive days is 60 hours.",
+    "reference_contexts": ["Para 8.1: In 7 consecutive days, the maximum cumulative duty period is 60 hours."]
+  },
+  {
+    "user_input": "What is the maximum cumulative duty period in 14 days?",
+    "reference": "The maximum cumulative duty period in 14 consecutive days is 100 hours.",
+    "reference_contexts": ["Para 8.2: In 14 consecutive days, the maximum cumulative duty period is 100 hours."]
+  },
+  {
+    "user_input": "What is the maximum cumulative duty period in 28 days?",
+    "reference": "The maximum cumulative duty period in 28 consecutive days is 190 hours.",
+    "reference_contexts": ["Para 8.3: In 28 consecutive days, the maximum cumulative duty period is 190 hours."]
+  },
+  {
+    "user_input": "What is the maximum cumulative duty period in 365 days?",
+    "reference": "The maximum cumulative duty period in 365 consecutive days is 1800 hours.",
+    "reference_contexts": ["Para 8.5: In 365 consecutive days, the maximum cumulative duty period is 1800 hours."]
+  },
+  {
+    "user_input": "What is the maximum cumulative flight time in 90 days?",
+    "reference": "The maximum cumulative flight time in 90 consecutive days is 300 hours.",
+    "reference_contexts": ["Para 8.4: In 90 consecutive days, the maximum cumulative flight time is 300 hours."]
+  },
+  {
+    "user_input": "How does standby at home or hotel affect FDP when it culminates into duty?",
+    "reference": "If standby at home or hotel culminates into duty within first 6 hours, no part counts as FDP. If it culminates at 6 hours or later, FDP is reduced by 50% of the standby time.",
+    "reference_contexts": ["Para 11.2.3: Standby at home/hotel culminating within 6 hours counts nothing. At 6 hours or later, FDP reduced by 50% of standby time."]
+  },
+  {
+    "user_input": "How does standby at home or hotel affect cumulative duty when it does not culminate into duty?",
+    "reference": "If standby at home or hotel does not culminate into duty, 25% of its time shall be considered under cumulative duty.",
+    "reference_contexts": ["Para 11.2.4: If standby at home/hotel does not culminate into duty, 25% of its time counts under cumulative duty."]
+  },
+  {
+    "user_input": "What is the maximum FDP with 3 sectors for acclimatized crew?",
+    "reference": "For acclimatized crew with 3 sectors, the maximum FDP is 12 hours.",
+    "reference_contexts": ["Para 6.1.3: For acclimatized crew with 3 sectors, max FDP is 12 hours."]
+  },
+  {
+    "user_input": "What is the maximum FDP with 4 sectors for acclimatized crew?",
+    "reference": "For acclimatized crew with 4 sectors, the maximum FDP is 11 hours.",
+    "reference_contexts": ["Para 6.1.4: For acclimatized crew with 4 sectors, max FDP is 11 hours."]
+  },
+  {
+    "user_input": "What is the maximum flight time with 1-2 sectors for non-acclimatized crew?",
+    "reference": "For non-acclimatized crew with 1-2 sectors, the maximum flight time is 8 hours.",
+    "reference_contexts": ["Para 6.1.1: For non-acclimatized crew with 1-2 sectors, max flight time is 8 hours."]
+  },
+  {
+    "user_input": "What is the maximum FDP with 1-2 sectors for non-acclimatized crew?",
+    "reference": "For non-acclimatized crew with 1-2 sectors, the maximum FDP is 14 hours.",
+    "reference_contexts": ["Para 6.1.1: For non-acclimatized crew with 1-2 sectors, max FDP is 14 hours."]
+  },
+  {
+    "user_input": "What is the maximum FDP with 1-2 sectors for non-acclimatized crew encroaching night duty?",
+    "reference": "For non-acclimatized crew with 1-2 sectors encroaching night duty, the maximum FDP is 13 hours.",
+    "reference_contexts": ["Para 6.1.2: For non-acclimatized crew with 1-2 sectors encroaching night duty, max FDP is 13 hours."]
+  },
+  {
+    "user_input": "What is the maximum flight time with 3 sectors for acclimatized crew?",
+    "reference": "For acclimatized crew with 3 sectors, the maximum flight time is 10 hours.",
+    "reference_contexts": ["Para 6.1.3: For acclimatized crew with 3 sectors, max flight time is 10 hours."]
+  }
+]

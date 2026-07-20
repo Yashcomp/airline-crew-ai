@@ -174,6 +174,18 @@ def answer_flight_query(question: str) -> str:
     disrupted = get_disrupted_flights()
     upcoming = get_upcoming_flights(hours_ahead=12)
 
+    delay_match = re.search(r"delay\s+(?:.*?\s+)?by\s+(\d+)\s*(hour|hours|hr|hrs|min|minutes)", lowered)
+    if delay_match:
+        amount = int(delay_match.group(1))
+        unit = delay_match.group(2)
+        if unit.startswith("hour") or unit.startswith("hr"):
+            total_min = amount * 60
+        else:
+            total_min = amount
+        flight_ids = re.findall(r"([A-Z]{2,3}[-_]?\d{2,4})", question, re.IGNORECASE)
+        if flight_ids:
+            return f"Delay request for {flight_ids[0].upper()}: {total_min} minutes. Use the chat to process this delay."
+
     flight_ids = re.findall(r"([A-Z]{2,3}[-_]?\d{2,4})", question, re.IGNORECASE)
     if flight_ids:
         lines = []

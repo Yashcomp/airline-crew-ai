@@ -1,0 +1,4 @@
+question,response_preview,reference_preview,faithfulness,context_recall,context_precision
+What is the maximum flight duty period for a two-pilot operation?,"Based on the provided context, there is no specific information regarding the maximum flight duty pe","For a two-pilot operation, the maximum flight duty period depends on the number of sectors and time ",0.250,0.500,0.750
+How many hours of rest are required before a flight duty period?,The context provided does not specify a minimum number of hours of rest required before a flight dut,The minimum rest before a flight duty period is the greater of: (a) as long as the preceding duty pe,0.500,1.000,0.750
+What is the maximum cumulative flight time allowed in 7 consecutive days?,"The maximum cumulative flight time allowed in 7 consecutive days is 35 hours, according to clause [4",The maximum cumulative flight time in 7 consecutive days is 35 hours.,0.250,0.500,0.750

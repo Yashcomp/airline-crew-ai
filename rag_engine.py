@@ -9,8 +9,9 @@ from typing import Iterable, List, Optional, Sequence
 KB_ROOT = Path("knowledge_base")
 DGCA_RULES_DIR = Path("dgca_rules")
 CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 150
-DEFAULT_TOP_K = 4
+CHUNK_OVERLAP = 200
+DEFAULT_TOP_K = 6
+RETRIEVAL_THRESHOLD = 0.7
 AZURE_API_VERSION_DEFAULT = "2024-02-15-preview"
 
 RULE_KEYWORDS = ("regulation", "dgca", "fdtl", "rule", "clause", "legal", "compliance")
@@ -216,6 +217,10 @@ def build_vectorstore(pdf_folder: Optional[Path] = None):
     return _build_vectorstore_cached(str(folder), mode, folder_mtime_ns)
 
 
+def clear_vectorstore_cache():
+    _build_vectorstore_cached.cache_clear()
+
+
 def retrieve_legal_guidance(
     query: str,
     pdf_folder: Optional[Path] = None,
@@ -231,7 +236,11 @@ def retrieve_legal_guidance(
         return DummyLLM().synthesize(query, "No DGCA PDF pages were loaded or the local retrieval stack is unavailable.")
 
     try:
-        relevant_docs = vectorstore.similarity_search(query, k=top_k)
+        raw_docs = vectorstore.similarity_search_with_score(query, k=top_k)
+        relevant_docs = [
+            doc for doc, score in raw_docs
+            if score <= RETRIEVAL_THRESHOLD
+        ]
     except Exception:
         relevant_docs = []
 
@@ -244,10 +253,18 @@ def retrieve_legal_guidance(
         return llm.synthesize(query, context)
 
     prompt = (
-        "You are a DGCA compliance assistant. Use only the provided context to answer in plain English. "
-        "Cite the most relevant clause references when possible.\n\n"
-        f"User scenario: {query}\n\n"
-        f"Context:\n{context}"
+        "You are a DGCA compliance assistant. You must answer STRICTLY and ONLY using the provided context.\n\n"
+        "CRITICAL RULES:\n"
+        "1. EVERY claim in your answer MUST come directly from the context below. No exceptions.\n"
+        "2. Do NOT use any outside knowledge, general aviation knowledge, or common sense.\n"
+        "3. Do NOT rephrase, reinterpret, or extend information beyond what is explicitly written.\n"
+        "4. If the context mentions a specific number, limit, or rule, quote it exactly.\n"
+        "5. If the context does NOT contain enough information to answer, respond with:\n"
+        "   'The retrieved context does not contain sufficient information to answer this question.'\n"
+        "6. Do NOT guess, infer, or assume anything that is not directly stated in the context.\n"
+        "7. Always cite the clause or paragraph reference when available.\n\n"
+        f"User question: {query}\n\n"
+        f"Context (use ONLY this information):\n{context}"
     )
 
     try:
@@ -273,8 +290,9 @@ def retrieve_legal_guidance_with_sources(
     mode = "ollama"
     if vectorstore is not None:
         try:
-            docs = vectorstore.similarity_search(query, k=top_k)
-            context, sources = _format_context(docs)
+            raw_docs = vectorstore.similarity_search_with_score(query, k=top_k)
+            filtered = [doc for doc, score in raw_docs if score <= RETRIEVAL_THRESHOLD]
+            context, sources = _format_context(filtered)
             mode = "azure" if _has_azure_credentials() else "ollama"
         except Exception:
             pass
