@@ -1,269 +1,173 @@
 from __future__ import annotations
 
-import random
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
+import pandas as pd
+from xgboost import XGBClassifier, XGBRegressor
+
+from ml_engine.feature_engineering import (
+    build_features, build_single_flight_features,
+    get_training_data, FEATURE_COLUMNS,
+)
 
 
-# ---------------------------------------------------------------------------
-# Legacy hardcoded fallbacks (used when ops_flights table is empty)
-# ---------------------------------------------------------------------------
-_AIRPORT_RISK_FALLBACK = {
-    "DEL": 0.35, "BOM": 0.30, "CCU": 0.25, "BLR": 0.20,
-    "MAA": 0.22, "HYD": 0.18, "GOI": 0.15,
-}
+_MODELS_DIR = Path(__file__).parent / "models"
+_CLASSIFIER_PATH = _MODELS_DIR / "delay_classifier.pkl"
+_REGRESSOR_PATH = _MODELS_DIR / "delay_regressor.pkl"
+_MODEL_METADATA_PATH = _MODELS_DIR / "model_metadata.pkl"
 
-_AIRCRAFT_RELIABILITY_FALLBACK = {
-    "B737": 0.92, "A320": 0.94, "A321": 0.93, "ATR": 0.88,
-}
-
-_HOURLY_RISK_FALLBACK = {
-    0: 0.40, 1: 0.42, 2: 0.45, 3: 0.48, 4: 0.30, 5: 0.15,
-    6: 0.12, 7: 0.18, 8: 0.25, 9: 0.22, 10: 0.20, 11: 0.22,
-    12: 0.28, 13: 0.25, 14: 0.22, 15: 0.20, 16: 0.25, 17: 0.30,
-    18: 0.35, 19: 0.38, 20: 0.42, 21: 0.45, 22: 0.48, 23: 0.44,
-}
+_DELAY_THRESHOLD_MIN = 15.0
 
 
-# ---------------------------------------------------------------------------
-# Learned distributions from ops_flights
-# ---------------------------------------------------------------------------
-def _build_delay_profiles(db_path: Path) -> Dict[str, Any]:
-    if not db_path.exists():
-        return {}
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+def _ensure_models_dir() -> None:
+    _MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    profiles: Dict[str, Any] = {}
 
-    # Overall delay stats
-    total = conn.execute("SELECT COUNT(*) FROM ops_flights").fetchone()[0]
-    if total == 0:
-        conn.close()
-        return {}
-    profiles["total_flights"] = total
+def _load_models() -> Tuple[Optional[XGBClassifier], Optional[XGBRegressor]]:
+    if not _CLASSIFIER_PATH.exists() or not _REGRESSOR_PATH.exists():
+        return None, None
+    try:
+        clf = joblib.load(_CLASSIFIER_PATH)
+        reg = joblib.load(_REGRESSOR_PATH)
+        return clf, reg
+    except Exception:
+        return None, None
 
-    delayed = conn.execute(
-        "SELECT COUNT(*) FROM ops_flights WHERE delay_min > 0"
-    ).fetchone()[0]
-    profiles["delayed_flights"] = delayed
-    profiles["overall_delay_rate"] = delayed / total if total > 0 else 0
 
-    avg_delay = conn.execute(
-        "SELECT AVG(delay_min) FROM ops_flights WHERE delay_min > 0"
-    ).fetchone()[0] or 0
-    profiles["avg_delay_min"] = avg_delay
+def _save_models(clf: XGBClassifier, reg: XGBRegressor, metadata: Dict[str, Any]) -> None:
+    _ensure_models_dir()
+    joblib.dump(clf, _CLASSIFIER_PATH)
+    joblib.dump(reg, _REGRESSOR_PATH)
+    joblib.dump(metadata, _MODEL_METADATA_PATH)
 
-    # Per-airport delay rate
-    airport_rows = conn.execute("""
-        SELECT origin,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed,
-               AVG(CASE WHEN delay_min > 0 THEN delay_min ELSE 0 END) as avg_delay
-        FROM ops_flights GROUP BY origin
-    """).fetchall()
-    profiles["by_airport"] = {
-        r["origin"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-            "avg_delay_min": round(r["avg_delay"] or 0, 1),
+
+def _load_metadata() -> Dict[str, Any]:
+    if _MODEL_METADATA_PATH.exists():
+        try:
+            return joblib.load(_MODEL_METADATA_PATH)
+        except Exception:
+            pass
+    return {}
+
+
+def train_model(
+    min_samples: int = 30,
+    callsigns: Optional[List[str]] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if callsigns:
+        min_samples = min(min_samples, 5)
+    features, binary_target, reg_target = get_training_data(
+        min_samples=min_samples, callsigns=callsigns, db_path=db_path,
+    )
+
+    if len(features) < min_samples:
+        return {
+            "status": "insufficient_data",
+            "samples": len(features),
+            "min_required": min_samples,
+            "message": f"Need {min_samples} samples, have {len(features)}. Using heuristic fallback.",
         }
-        for r in airport_rows
+
+    clf = XGBClassifier(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=42,
+    )
+    clf.fit(features, binary_target)
+
+    reg = XGBRegressor(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.1,
+        random_state=42,
+    )
+    reg.fit(features, reg_target)
+
+    from sklearn.metrics import accuracy_score, mean_absolute_error
+    clf_pred = clf.predict(features)
+    clf_accuracy = accuracy_score(binary_target, clf_pred)
+    reg_pred = reg.predict(features)
+    reg_mae = mean_absolute_error(reg_target, reg_pred)
+
+    feature_importance = dict(zip(FEATURE_COLUMNS, clf.feature_importances_.tolist()))
+
+    metadata = {
+        "trained_at": datetime.now().isoformat(),
+        "samples": len(features),
+        "classifier_accuracy": round(clf_accuracy, 4),
+        "regressor_mae": round(reg_mae, 2),
+        "feature_importance": {k: round(v, 4) for k, v in sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)},
+        "feature_columns": FEATURE_COLUMNS,
     }
 
-    # Per-aircraft delay rate
-    ac_rows = conn.execute("""
-        SELECT aircraft_type,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed,
-               AVG(CASE WHEN delay_min > 0 THEN delay_min ELSE 0 END) as avg_delay
-        FROM ops_flights GROUP BY aircraft_type
-    """).fetchall()
-    profiles["by_aircraft"] = {
-        r["aircraft_type"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-            "avg_delay_min": round(r["avg_delay"] or 0, 1),
-        }
-        for r in ac_rows
+    _save_models(clf, reg, metadata)
+
+    return {
+        "status": "success",
+        "samples": len(features),
+        "classifier_accuracy": round(clf_accuracy, 4),
+        "regressor_mae": round(reg_mae, 2),
+        "feature_importance": metadata["feature_importance"],
+        "message": f"Trained on {len(features)} samples. Accuracy: {clf_accuracy:.1%}, MAE: {reg_mae:.1f} min",
     }
 
-    # Per-hour delay rate
-    hour_rows = conn.execute("""
-        SELECT CAST(strftime('%H', std) AS INTEGER) as hour,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed
-        FROM ops_flights GROUP BY hour ORDER BY hour
-    """).fetchall()
-    profiles["by_hour"] = {
-        r["hour"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
+
+def retrain_if_stale(max_age_hours: int = 24, callsigns: Optional[List[str]] = None, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    metadata = _load_metadata()
+    if not metadata:
+        return train_model(callsigns=callsigns, db_path=db_path)
+
+    trained_at = metadata.get("trained_at")
+    if trained_at:
+        try:
+            dt = datetime.fromisoformat(trained_at)
+            if datetime.now() - dt < timedelta(hours=max_age_hours):
+                return {"status": "up_to_date", "message": "Model is current."}
+        except (ValueError, TypeError):
+            pass
+
+    return train_model(callsigns=callsigns, db_path=db_path)
+
+
+def _predict_with_ml(features_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    clf, reg = _load_models()
+    if clf is None or reg is None:
+        return None
+
+    try:
+        prob = clf.predict_proba(features_df)[0]
+        delay_prob = float(prob[1]) if len(prob) > 1 else float(prob[0])
+        expected_delay = float(reg.predict(features_df)[0])
+        expected_delay = max(0.0, expected_delay)
+
+        feature_importance = {}
+        if hasattr(clf, "feature_importances_"):
+            for i, col in enumerate(FEATURE_COLUMNS):
+                if i < len(clf.feature_importances_):
+                    feature_importance[col] = round(float(clf.feature_importances_[i]), 4)
+
+        top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        return {
+            "delay_probability": round(delay_prob, 3),
+            "expected_delay_min": round(expected_delay, 1),
+            "model_used": "xgboost",
+            "top_influencing_features": [{"feature": k, "importance": v} for k, v in top_features],
         }
-        for r in hour_rows
-    }
-
-    # Per-delay-reason frequency
-    reason_rows = conn.execute("""
-        SELECT delay_reason, COUNT(*) as cnt, AVG(delay_min) as avg_delay
-        FROM ops_flights WHERE delay_min > 0 AND delay_reason != ''
-        GROUP BY delay_reason ORDER BY cnt DESC
-    """).fetchall()
-    profiles["by_reason"] = {
-        r["delay_reason"]: {
-            "count": r["cnt"],
-            "avg_delay_min": round(r["avg_delay"] or 0, 1),
-        }
-        for r in reason_rows
-    }
-
-    # Per-route-type delay rate
-    route_rows = conn.execute("""
-        SELECT route_type,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed
-        FROM ops_flights GROUP BY route_type
-    """).fetchall()
-    profiles["by_route_type"] = {
-        r["route_type"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-        }
-        for r in route_rows
-    }
-
-    # Per-season delay rate
-    season_rows = conn.execute("""
-        SELECT season,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed
-        FROM ops_flights GROUP BY season
-    """).fetchall()
-    profiles["by_season"] = {
-        r["season"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-        }
-        for r in season_rows
-    }
-
-    # Per-day-of-week delay rate
-    dow_rows = conn.execute("""
-        SELECT day_of_week,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed
-        FROM ops_flights GROUP BY day_of_week
-    """).fetchall()
-    profiles["by_day_of_week"] = {
-        r["day_of_week"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-        }
-        for r in dow_rows
-    }
-
-    # Turbulence correlation
-    turb_rows = conn.execute("""
-        SELECT turbulence_category,
-               COUNT(*) as total,
-               SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed,
-               AVG(delay_min) as avg_delay
-        FROM ops_flights WHERE turbulence_category != ''
-        GROUP BY turbulence_category
-    """).fetchall()
-    profiles["by_turbulence"] = {
-        r["turbulence_category"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-            "avg_delay_min": round(r["avg_delay"] or 0, 1),
-        }
-        for r in turb_rows
-    }
-
-    # Seat occupancy correlation (bin into quartiles)
-    occ_rows = conn.execute("""
-        SELECT
-            CASE
-                WHEN seat_occupancy < 0.25 THEN 'Low (<25%)'
-                WHEN seat_occupancy < 0.50 THEN 'Medium (25-50%)'
-                WHEN seat_occupancy < 0.75 THEN 'High (50-75%)'
-                ELSE 'Full (75%+)'
-            END as occ_bin,
-            COUNT(*) as total,
-            SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed,
-            AVG(delay_min) as avg_delay
-        FROM ops_flights GROUP BY occ_bin
-    """).fetchall()
-    profiles["by_occupancy"] = {
-        r["occ_bin"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-            "avg_delay_min": round(r["avg_delay"] or 0, 1),
-        }
-        for r in occ_rows
-    }
-
-    # Distance correlation (bin)
-    dist_rows = conn.execute("""
-        SELECT
-            CASE
-                WHEN distance < 1000 THEN 'Short (<1000km)'
-                WHEN distance < 5000 THEN 'Medium (1000-5000km)'
-                ELSE 'Long (5000km+)'
-            END as dist_bin,
-            COUNT(*) as total,
-            SUM(CASE WHEN delay_min > 0 THEN 1 ELSE 0 END) as delayed,
-            AVG(delay_min) as avg_delay
-        FROM ops_flights GROUP BY dist_bin
-    """).fetchall()
-    profiles["by_distance"] = {
-        r["dist_bin"]: {
-            "total": r["total"],
-            "delayed": r["delayed"],
-            "delay_rate": r["delayed"] / r["total"] if r["total"] > 0 else 0,
-            "avg_delay_min": round(r["avg_delay"] or 0, 1),
-        }
-        for r in dist_rows
-    }
-
-    conn.close()
-    return profiles
+    except Exception:
+        return None
 
 
-# Cache
-_PROFILES_CACHE: Optional[Dict[str, Any]] = None
-
-
-def _get_profiles(db_path: Optional[Path] = None) -> Dict[str, Any]:
-    global _PROFILES_CACHE
-    path = db_path or (Path(__file__).parent.parent / "data" / "flights.db")
-    if _PROFILES_CACHE is not None:
-        return _PROFILES_CACHE
-    _PROFILES_CACHE = _build_delay_profiles(path)
-    return _PROFILES_CACHE
-
-
-def invalidate_profiles_cache():
-    global _PROFILES_CACHE
-    _PROFILES_CACHE = None
-
-
-# ---------------------------------------------------------------------------
-# Feature vector (enhanced with learned distributions)
-# ---------------------------------------------------------------------------
-def _feature_vector(
+def _heuristic_predict(
     origin: str,
     destination: str,
     aircraft_type: str,
@@ -271,75 +175,40 @@ def _feature_vector(
     pax_count: int,
     flight_duration_min: int,
     is_international: bool,
-    turbulence_category: str = "",
-    seat_occupancy: float = 0.5,
-    distance: float = 2000.0,
-    hour_of_week: int = 0,
-) -> np.ndarray:
-    profiles = _get_profiles()
+) -> Dict[str, Any]:
+    hour_risk_map = {
+        0: 0.40, 1: 0.42, 2: 0.45, 3: 0.48, 4: 0.30, 5: 0.15,
+        6: 0.12, 7: 0.18, 8: 0.25, 9: 0.22, 10: 0.20, 11: 0.22,
+        12: 0.28, 13: 0.25, 14: 0.22, 15: 0.20, 16: 0.25, 17: 0.30,
+        18: 0.35, 19: 0.38, 20: 0.42, 21: 0.45, 22: 0.48, 23: 0.44,
+    }
 
-    if profiles and "by_airport" in profiles:
-        origin_risk = profiles["by_airport"].get(origin, {}).get("delay_rate", 0.25)
-        dest_risk = profiles["by_airport"].get(destination, {}).get("delay_rate", 0.25)
-    else:
-        origin_risk = _AIRPORT_RISK_FALLBACK.get(origin, 0.25)
-        dest_risk = _AIRPORT_RISK_FALLBACK.get(destination, 0.25)
+    hour_risk = hour_risk_map.get(departure_hour, 0.25)
+    pax_risk = min(pax_count / 200.0, 1.0) * 0.06
+    duration_risk = min(flight_duration_min / 300.0, 1.0) * 0.08
+    intl_risk = 0.04 if is_international else 0.0
+    peak_risk = 0.10 if departure_hour in (8, 9, 17, 18, 19, 20) else 0.0
 
-    if profiles and "by_aircraft" in profiles:
-        ac_data = profiles["by_aircraft"].get(aircraft_type, {})
-        aircraft_rel = 1.0 - ac_data.get("delay_rate", 0.1) if ac_data else 0.90
-    else:
-        aircraft_rel = _AIRCRAFT_RELIABILITY_FALLBACK.get(aircraft_type, 0.90)
+    prob = min(0.95, max(0.05, hour_risk + pax_risk + duration_risk + intl_risk + peak_risk))
+    expected_delay = 0.0
+    if prob > 0.3:
+        expected_delay = prob * 35.0
+    elif prob > 0.15:
+        expected_delay = prob * 20.0
 
-    if profiles and "by_hour" in profiles:
-        hour_data = profiles["by_hour"].get(departure_hour, {})
-        hour_risk = hour_data.get("delay_rate", 0.25) if hour_data else 0.25
-    else:
-        hour_risk = _HOURLY_RISK_FALLBACK.get(departure_hour, 0.25)
-
-    pax_factor = min(pax_count / 200.0, 1.0)
-    duration_factor = min(flight_duration_min / 300.0, 1.0)
-    intl_flag = 1.0 if is_international else 0.0
-    peak_flag = 1.0 if departure_hour in (8, 9, 17, 18, 19, 20) else 0.0
-    night_flag = 1.0 if departure_hour >= 22 or departure_hour < 5 else 0.0
-    dow = (hour_of_week % 168) // 24
-    weekend_flag = 1.0 if dow >= 5 else 0.0
-    occ_factor = seat_occupancy
-    dist_factor = min(distance / 10000.0, 1.0)
-
-    if profiles and "by_turbulence" in profiles:
-        turb_data = profiles["by_turbulence"].get(turbulence_category, {})
-        turb_risk = turb_data.get("delay_rate", 0.1) if turb_data else 0.1
-    else:
-        turb_risk = 0.1
-
-    return np.array([
-        origin_risk, dest_risk, aircraft_rel, hour_risk,
-        pax_factor, duration_factor, intl_flag, peak_flag,
-        night_flag, weekend_flag, occ_factor, dist_factor, turb_risk,
-    ])
+    return {
+        "delay_probability": round(prob, 3),
+        "expected_delay_min": round(expected_delay, 1),
+        "model_used": "heuristic",
+        "top_influencing_features": [],
+    }
 
 
-_weights = np.array([
-    0.15, 0.10, -0.12, 0.18,
-    0.06, 0.08, 0.04, 0.10,
-    0.06, 0.02, 0.05, 0.04, 0.08,
-])
-_bias = -0.05
-
-
-def _sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def predict_delay(
-    origin: str,
-    destination: str,
-    aircraft_type: str,
-    departure_hour: int,
+    origin: str = "BLR",
+    destination: str = "DEL",
+    aircraft_type: str = "B737",
+    departure_hour: int = 12,
     pax_count: int = 150,
     flight_duration_min: int = 120,
     is_international: bool = False,
@@ -347,44 +216,74 @@ def predict_delay(
     turbulence_category: str = "",
     seat_occupancy: float = 0.5,
     distance: float = 2000.0,
+    prev_flight_delay: float = 0.0,
+    wind_speed_kmh: float = 0.0,
+    wind_gusts_kmh: float = 0.0,
+    visibility_m: float = 10000.0,
+    cloud_cover_pct: float = 0.0,
+    precipitation_mm: float = 0.0,
+    temperature_c: float = 25.0,
+    pressure_hpa: float = 1013.0,
 ) -> Dict[str, Any]:
     if departure_time is None:
-        departure_time = datetime.now().replace(hour=departure_hour, minute=0)
-    hour_of_week = departure_time.weekday() * 24 + departure_hour
+        departure_time = datetime.now()
 
-    features = _feature_vector(
-        origin, destination, aircraft_type, departure_hour,
-        pax_count, flight_duration_min, is_international,
-        turbulence_category, seat_occupancy, distance, hour_of_week,
+    wind_speed_kmh = float(wind_speed_kmh or 0)
+    wind_gusts_kmh = float(wind_gusts_kmh or 0)
+    visibility_m = float(visibility_m or 10000)
+    cloud_cover_pct = float(cloud_cover_pct or 0)
+    precipitation_mm = float(precipitation_mm or 0)
+    temperature_c = float(temperature_c or 25)
+    pressure_hpa = float(pressure_hpa or 1013)
+
+    route_avg_delay = 0.0
+    try:
+        _db = sqlite3.connect(str(Path(__file__).parent.parent / "data" / "flights.db"))
+        _cur = _db.execute(
+            "SELECT AVG(deviation_min) FROM delay_labels WHERE origin=? AND destination=? AND is_delayed=1",
+            (origin, destination),
+        )
+        _row = _cur.fetchone()
+        if _row and _row[0] is not None:
+            route_avg_delay = float(_row[0])
+        _db.close()
+    except Exception:
+        pass
+
+    features_df = build_single_flight_features(
+        hour_of_day=departure_hour,
+        day_of_week=departure_time.weekday(),
+        month=departure_time.month,
+        route=f"{origin}_{destination}",
+        prev_delay=prev_flight_delay,
+        wind_speed_kmh=wind_speed_kmh,
+        wind_gusts_kmh=wind_gusts_kmh,
+        visibility_m=visibility_m,
+        cloud_cover_pct=cloud_cover_pct,
+        precipitation_mm=precipitation_mm,
+        temperature_c=temperature_c,
+        pressure_hpa=pressure_hpa,
+        route_avg_delay=route_avg_delay,
     )
 
-    logit = float(np.dot(features, _weights) + _bias)
-    delay_probability = _sigmoid(logit)
+    ml_result = _predict_with_ml(features_df)
+    if ml_result:
+        result = ml_result
+    else:
+        result = _heuristic_predict(
+            origin, destination, aircraft_type, departure_hour,
+            pax_count, flight_duration_min, is_international,
+        )
 
-    profiles = _get_profiles()
-    avg_delay = profiles.get("avg_delay_min", 30) if profiles else 30
-
-    expected_delay_min = 0.0
-    if delay_probability > 0.3:
-        expected_delay_min = delay_probability * avg_delay + random.uniform(5, 20)
-    elif delay_probability > 0.15:
-        expected_delay_min = delay_probability * avg_delay * 0.6 + random.uniform(5, 10)
-
+    prob = result["delay_probability"]
+    exp_delay = result["expected_delay_min"]
     risk_level = "Low"
-    if delay_probability > 0.5:
+    if prob > 0.5 or exp_delay > 45:
         risk_level = "High"
-    elif delay_probability > 0.3:
+    elif prob > 0.3 or exp_delay > 20:
         risk_level = "Medium"
 
     factors = []
-
-    if profiles and "by_airport" in profiles:
-        ap = profiles["by_airport"].get(origin, {})
-        if ap.get("delay_rate", 0) > 0.30:
-            factors.append(f"{origin} has high congestion risk ({ap['delay_rate']:.0%} historical delay rate)")
-    elif origin in _AIRPORT_RISK_FALLBACK and _AIRPORT_RISK_FALLBACK[origin] > 0.30:
-        factors.append(f"{origin} has high congestion risk")
-
     if departure_hour in (8, 9, 17, 18, 19, 20):
         factors.append("Peak hour departure increases delay risk")
     if departure_hour >= 22 or departure_hour < 5:
@@ -393,30 +292,39 @@ def predict_delay(
         factors.append("High passenger load extends boarding time")
     if is_international:
         factors.append("International flights require additional clearance")
-    if seat_occupancy > 0.85:
-        factors.append("Near-full aircraft increases boarding complexity")
-    if distance > 5000:
-        factors.append("Long-haul flight has higher fuel/weather exposure")
+    if prev_flight_delay > 15:
+        factors.append(f"Aircraft arrived {prev_flight_delay:.0f} min late from previous flight")
+    if wind_speed_kmh > 40:
+        factors.append(f"High wind speed ({wind_speed_kmh:.0f} km/h) may cause delays")
+    if wind_gusts_kmh > 60:
+        factors.append(f"Strong wind gusts ({wind_gusts_kmh:.0f} km/h)")
+    if visibility_m < 1000:
+        factors.append(f"Low visibility ({visibility_m:.0f}m) may cause approach delays")
+    if precipitation_mm > 5:
+        factors.append(f"Heavy precipitation ({precipitation_mm:.1f}mm)")
+    if cloud_cover_pct > 80:
+        factors.append("Overcast conditions")
+    if result["model_used"] == "xgboost":
+        factors.append("Prediction based on trained ML model")
+    else:
+        factors.append("Prediction based on heuristic (model not yet trained)")
 
-    if profiles and "by_reason" in profiles:
-        top_reason = max(profiles["by_reason"].items(), key=lambda x: x[1]["count"])
-        factors.append(f"Most common delay cause: {top_reason[0]} ({top_reason[1]['count']} occurrences, avg {top_reason[1]['avg_delay_min']:.0f} min)")
-
-    return {
-        "delay_probability": round(delay_probability, 3),
-        "expected_delay_min": round(expected_delay_min, 1),
+    result.update({
         "risk_level": risk_level,
         "factors": factors,
         "features": {
-            "origin_risk": round(float(features[0]), 3),
-            "dest_risk": round(float(features[1]), 3),
-            "aircraft_reliability": round(float(features[2]), 3),
-            "hour_risk": round(float(features[3]), 3),
-            "occupancy_factor": round(float(features[10]), 3),
-            "distance_factor": round(float(features[11]), 3),
-            "turbulence_risk": round(float(features[12]), 3),
+            "wind_speed_knots": round(wind_speed_kmh * 0.539957, 1),
+            "wind_gust_knots": round(wind_gusts_kmh * 0.539957, 1),
+            "visibility_m": visibility_m,
+            "cloud_cover_pct": cloud_cover_pct,
+            "precipitation_mm": precipitation_mm,
+            "temperature_c": temperature_c,
+            "pressure_hpa": pressure_hpa,
+            "prev_flight_delay": prev_flight_delay,
         },
-    }
+    })
+
+    return result
 
 
 def train_delay_model(flight_data: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -439,7 +347,7 @@ def train_delay_model(flight_data: List[Dict[str, Any]]) -> Dict[str, Any]:
             flight_duration_min=record.get("flight_duration_min", 120),
             is_international=record.get("is_international", False),
         )
-        was_delayed = record.get("actual_delay_min", 0) > 15
+        was_delayed = record.get("actual_delay_min", 0) > _DELAY_THRESHOLD_MIN
         predicted_delayed = predicted["delay_probability"] > 0.3
         if was_delayed == predicted_delayed:
             correct += 1
@@ -455,90 +363,168 @@ def train_delay_model(flight_data: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def get_delay_insights(db_path: Optional[Path] = None) -> Dict[str, Any]:
-    from data.flights_db import get_flights
-    flights = get_flights(db_path=db_path)
-    if not flights:
-        return {"message": "No flight data available for insights."}
+    from data.opensky_db import get_flight_stats, get_feature_table
+    stats = get_flight_stats(db_path)
+    if stats.get("total_flights", 0) == 0:
+        return {
+            "total_flights": 0,
+            "delayed_flights": 0,
+            "delay_rate": 0,
+            "message": "No OpenSky flight data available. Run 'Seed Historical Data' first.",
+        }
 
-    delayed = [f for f in flights if f.status.value in ("delayed", "cancelled")]
-    total = len(flights)
-    delay_rate = len(delayed) / total if total > 0 else 0
+    df = get_feature_table(db_path)
+    if df.empty:
+        return {
+            "total_flights": stats["total_flights"],
+            "delayed_flights": 0,
+            "delay_rate": 0,
+            "message": "Flight data exists but no delay labels computed.",
+        }
 
-    by_origin: Dict[str, Dict[str, int]] = {}
-    by_hour: Dict[int, int] = {}
-    by_aircraft: Dict[str, int] = {}
+    total = len(df)
+    delayed = int(df["is_delayed"].sum()) if "is_delayed" in df.columns else 0
+    delay_rate = delayed / total if total > 0 else 0
 
-    for f in delayed:
-        by_origin.setdefault(f.origin, {"delayed": 0, "total": 0})
-        by_origin[f.origin]["delayed"] += 1
+    by_hour = {}
+    if "departure_hour" in df.columns:
+        hour_counts = df[df["is_delayed"] == 1]["departure_hour"].value_counts()
+        by_hour = {int(h): int(c) for h, c in hour_counts.items()}
 
-        by_hour.setdefault(f.std.hour, 0)
-        by_hour[f.std.hour] += 1
+    by_route = {}
+    if "origin_airport" in df.columns and "destination_airport" in df.columns:
+        route_delays = df[df["is_delayed"] == 1].groupby(
+            ["origin_airport", "destination_airport"]
+        ).size()
+        for (o, d), c in route_delays.items():
+            by_route[f"{o}-{d}"] = int(c)
 
-        by_aircraft.setdefault(f.aircraft_type, 0)
-        by_aircraft[f.aircraft_type] += 1
-
-    for f in flights:
-        by_origin.setdefault(f.origin, {"delayed": 0, "total": 0})
-        by_origin[f.origin]["total"] += 1
-
-    risk_scores = {}
-    for airport, counts in by_origin.items():
-        rate = counts["delayed"] / counts["total"] if counts["total"] > 0 else 0
-        risk_scores[airport] = round(rate, 3)
-
-    peak_hours = sorted(by_hour.items(), key=lambda x: x[1], reverse=True)[:5]
+    model_meta = _load_metadata()
 
     return {
         "total_flights": total,
-        "delayed_flights": len(delayed),
+        "delayed_flights": delayed,
         "delay_rate": round(delay_rate, 3),
-        "airport_risk_scores": risk_scores,
-        "peak_delay_hours": [{"hour": h, "count": c} for h, c in peak_hours],
-        "aircraft_delays": by_aircraft,
+        "peak_delay_hours": [{"hour": h, "count": c} for h, c in sorted(by_hour.items(), key=lambda x: x[1], reverse=True)[:5]],
+        "delay_by_route": by_route,
+        "model_status": {
+            "trained": model_meta.get("trained_at") is not None,
+            "accuracy": model_meta.get("classifier_accuracy"),
+            "mae": model_meta.get("regressor_mae"),
+        },
     }
 
 
-# ---------------------------------------------------------------------------
-# Enhanced analytics from ops_flights
-# ---------------------------------------------------------------------------
 def get_delay_cause_breakdown(db_path: Optional[Path] = None) -> Dict[str, Any]:
-    profiles = _get_profiles(db_path)
-    if not profiles or "by_reason" not in profiles:
-        return {"message": "No ops flight data loaded. Use 'Load Operations Dataset' first."}
+    from data.opensky_db import get_feature_table
+    df = get_feature_table(db_path)
+    if df.empty:
+        return {"message": "No data available."}
+
+    causes = {}
+    if "wind_speed_kmh" in df.columns:
+        windy = df[df["wind_speed_kmh"] > 40]
+        if len(windy) > 0:
+            causes["high_wind"] = {"count": len(windy), "description": "Wind speed > 40 km/h"}
+
+    if "precipitation_mm" in df.columns:
+        rainy = df[df["precipitation_mm"] > 5]
+        if len(rainy) > 0:
+            causes["heavy_precipitation"] = {"count": len(rainy), "description": "Precipitation > 5mm"}
+
+    if "visibility_m" in df.columns:
+        low_vis = df[df["visibility_m"] < 1000]
+        if len(low_vis) > 0:
+            causes["low_visibility"] = {"count": len(low_vis), "description": "Visibility < 1000m"}
+
+    if "prev_flight_delay_min" in df.columns:
+        cascading = df[df["prev_flight_delay_min"] > 15]
+        if len(cascading) > 0:
+            causes["cascading_delay"] = {"count": len(cascading), "description": "Previous flight delay > 15 min"}
+
     return {
-        "total_flights": profiles["total_flights"],
-        "delayed_flights": profiles["delayed_flights"],
-        "overall_delay_rate": round(profiles["overall_delay_rate"], 3),
-        "causes": profiles["by_reason"],
+        "total_flights": len(df),
+        "delayed_flights": int(df["is_delayed"].sum()) if "is_delayed" in df.columns else 0,
+        "causes": causes,
     }
 
 
 def get_delay_by_airport(db_path: Optional[Path] = None) -> Dict[str, Any]:
-    profiles = _get_profiles(db_path)
-    if not profiles or "by_airport" not in profiles:
-        return {"message": "No ops flight data loaded."}
-    return profiles["by_airport"]
+    from data.opensky_db import get_feature_table
+    df = get_feature_table(db_path)
+    if df.empty:
+        return {"message": "No data available."}
+
+    result = {}
+    for airport in df["origin_airport"].dropna().unique():
+        subset = df[df["origin_airport"] == airport]
+        total = len(subset)
+        delayed = int(subset["is_delayed"].sum()) if "is_delayed" in subset.columns else 0
+        avg_dev = float(subset["deviation_min"].mean()) if "deviation_min" in subset.columns else 0
+        result[airport] = {
+            "total_flights": total,
+            "delayed_flights": delayed,
+            "delay_rate": round(delayed / total, 3) if total > 0 else 0,
+            "avg_deviation_min": round(avg_dev, 1),
+        }
+    return result
 
 
 def get_delay_by_time(db_path: Optional[Path] = None) -> Dict[str, Any]:
-    profiles = _get_profiles(db_path)
-    if not profiles:
-        return {"message": "No ops flight data loaded."}
-    return {
-        "by_hour": profiles.get("by_hour", {}),
-        "by_day_of_week": profiles.get("by_day_of_week", {}),
-        "by_season": profiles.get("by_season", {}),
-    }
+    from data.opensky_db import get_feature_table
+    df = get_feature_table(db_path)
+    if df.empty:
+        return {"message": "No data available."}
+
+    by_hour = {}
+    if "departure_hour" in df.columns:
+        for hour in range(24):
+            subset = df[df["departure_hour"] == hour]
+            if len(subset) > 0:
+                delayed = int(subset["is_delayed"].sum()) if "is_delayed" in subset.columns else 0
+                by_hour[hour] = {
+                    "total": len(subset),
+                    "delayed": delayed,
+                    "rate": round(delayed / len(subset), 3),
+                }
+
+    by_dow = {}
+    if "day_of_week" in df.columns:
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for dow in range(7):
+            subset = df[df["day_of_week"] == dow]
+            if len(subset) > 0:
+                delayed = int(subset["is_delayed"].sum()) if "is_delayed" in subset.columns else 0
+                by_dow[day_names[dow]] = {
+                    "total": len(subset),
+                    "delayed": delayed,
+                    "rate": round(delayed / len(subset), 3),
+                }
+
+    return {"by_hour": by_hour, "by_day_of_week": by_dow}
 
 
 def get_delay_by_route_type(db_path: Optional[Path] = None) -> Dict[str, Any]:
-    profiles = _get_profiles(db_path)
-    if not profiles:
-        return {"message": "No ops flight data loaded."}
-    return {
-        "by_route_type": profiles.get("by_route_type", {}),
-        "by_turbulence": profiles.get("by_turbulence", {}),
-        "by_occupancy": profiles.get("by_occupancy", {}),
-        "by_distance": profiles.get("by_distance", {}),
-    }
+    from data.opensky_db import get_feature_table
+    df = get_feature_table(db_path)
+    if df.empty:
+        return {"message": "No data available."}
+
+    by_route = {}
+    if "origin_airport" in df.columns and "destination_airport" in df.columns:
+        for route in df.groupby(["origin_airport", "destination_airport"]).groups:
+            o, d = route
+            subset = df[(df["origin_airport"] == o) & (df["destination_airport"] == d)]
+            total = len(subset)
+            delayed = int(subset["is_delayed"].sum()) if "is_delayed" in subset.columns else 0
+            by_route[f"{o}-{d}"] = {
+                "total": total,
+                "delayed": delayed,
+                "rate": round(delayed / total, 3) if total > 0 else 0,
+            }
+
+    return {"by_route_type": by_route}
+
+
+def invalidate_profiles_cache() -> None:
+    pass

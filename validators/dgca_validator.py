@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from math import inf
@@ -152,7 +155,12 @@ def check_crew_eligibility(
     flights: Optional[List[Flight]] = None,
     scenario_flight_hours: float = 0.0,
     scenario_is_night_duty: bool = False,
+    use_llm: bool = False,
+    delay_hours: float = 0.0,
 ) -> ComplianceResult:
+    if use_llm and flights:
+        return get_llm_compliance_decision(member, flights[0], delay_hours)
+
     violations: List[str] = []
     warnings: List[str] = []
 
@@ -189,7 +197,7 @@ def check_crew_eligibility(
 
     if flights:
         for flight in flights:
-            if not member.is_rated_on(flight.aircraft_type):
+            if member.role != Role.GROUND_STAFF and not member.is_rated_on(flight.aircraft_type):
                 violations.append(
                     f"Not type-rated for {flight.aircraft_type} (flight {flight.flight_id})"
                 )
@@ -405,12 +413,221 @@ def compute_cost(
     )
 
 
+def _build_crew_summary(member: CrewMember) -> str:
+    quals = ", ".join(q.aircraft_type for q in member.qualifications)
+    return (
+        f"Crew ID: {member.crew_id}\n"
+        f"Name: {member.name}\n"
+        f"Role: {member.role.value}\n"
+        f"Rest Status: {member.rest_status}\n"
+        f"Current Duty Hours: {member.current_duty_hours}\n"
+        f"Rolling 7-Day Hours: {member.rolling_7_day_hours}\n"
+        f"Consecutive Night Shifts: {member.consecutive_night_shifts}\n"
+        f"Consecutive Days On: {member.consecutive_days_on}\n"
+        f"Days Since Rest: {member.days_since_rest}\n"
+        f"Hours Flown (30 days): {member.hours_flown_30_days}\n"
+        f"Base Airport: {member.base_airport}\n"
+        f"Type Ratings: {quals}\n"
+    )
+
+
+def _build_flight_summary(flight: Flight, delay_hours: float = 0.0) -> str:
+    return (
+        f"Flight ID: {flight.flight_id}\n"
+        f"Route: {flight.origin} → {flight.destination}\n"
+        f"Aircraft: {flight.aircraft_type}\n"
+        f"Flight Duration: {flight.flight_hours}h\n"
+        f"Scheduled Departure: {flight.std.strftime('%H:%M')}\n"
+        f"Is Night Duty: {flight.is_night_duty}\n"
+        f"Delay: {delay_hours}h\n"
+    )
+
+
+def _build_rules_context() -> str:
+    hardcoded_rules = (
+        "DGCA CAR Section 7 Series J Part III - OFFICIAL DUTY LIMITS:\n\n"
+        "MAXIMUM DUTY HOURS (per 24 hours):\n"
+        "- Captain: 12 hours\n"
+        "- First Officer (FO): 12 hours\n"
+        "- Cabin Crew: 14 hours\n"
+        "- Ground Staff: 10 hours\n\n"
+        "ROLLING 7-DAY HOUR LIMITS:\n"
+        "- Captain: 35 hours\n"
+        "- First Officer (FO): 35 hours\n"
+        "- Cabin Crew: 45 hours\n"
+        "- Ground Staff: No limit\n\n"
+        "CONSECUTIVE NIGHT SHIFT LIMITS:\n"
+        "- Captain: 2 consecutive nights\n"
+        "- First Officer (FO): 2 consecutive nights\n"
+        "- Cabin Crew: 3 consecutive nights\n"
+        "- Ground Staff: No limit\n\n"
+        "REST REQUIREMENTS:\n"
+        "- Minimum rest between duty periods: 10 hours\n"
+        "- Rest must include a local night (if preceding duty > 18 hours)\n\n"
+        "WOCL (Window of Circadian Low):\n"
+        "- Hours: 02:00 to 06:00 local time\n"
+        "- Duty spanning entire WOCL is prohibited\n"
+        "- Ground Staff are EXEMPT from WOCL restrictions\n\n"
+        "TYPE RATING:\n"
+        "- Crew must be type-rated for the aircraft they operate\n"
+        "- GROUND STAFF ARE EXEMPT from type-rating checks\n\n"
+        "UNFORESEEN CIRCUMSTANCES:\n"
+        "- 30-minute extension allowed for unforeseen operational circumstances\n"
+        "- 60-minute extension with commander approval\n\n"
+        "SPLIT DUTY:\n"
+        "- Maximum 2-hour extension allowed\n"
+        "- Minimum 3-hour rest between duty periods\n\n"
+        "DELAY/REPLACEMENT RULES:\n"
+        "- Standby/replacement crew duty starts when the flight DEPARTS\n"
+        "- Do NOT add delay hours to standby crew's projected duty\n"
+        "- Evaluate standby crew against flight duration only\n"
+    )
+
+    try:
+        from rag_engine import retrieve_legal_guidance
+        rag_query = "DGCA flight duty period definition duty period limits"
+        rag_context = retrieve_legal_guidance(rag_query)
+        if rag_context and len(rag_context) > 50:
+            return hardcoded_rules + "\n\nADDITIONAL DGCA CONTEXT:\n" + rag_context
+    except Exception:
+        pass
+
+    return hardcoded_rules
+
+
+def get_llm_compliance_decision(
+    member: CrewMember,
+    flight: Flight,
+    delay_hours: float = 0.0,
+) -> ComplianceResult:
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
+    except ImportError:
+        return check_crew_eligibility(
+            member,
+            flights=[flight],
+            scenario_flight_hours=flight.flight_hours,
+            scenario_is_night_duty=flight.is_night_duty,
+        )
+
+    if not GROQ_API_KEY or GROQ_API_KEY == "your-groq-api-key-here":
+        return check_crew_eligibility(
+            member,
+            flights=[flight],
+            scenario_flight_hours=flight.flight_hours,
+            scenario_is_night_duty=flight.is_night_duty,
+        )
+
+    crew_summary = _build_crew_summary(member)
+    flight_summary = _build_flight_summary(flight, delay_hours)
+
+    system_prompt = """You are a DGCA compliance officer. Your job is to VALIDATE whether a crew member can be assigned to a flight.
+
+STEP-BY-STEP VALIDATION:
+1. Check REST STATUS: Must be "Legal"
+2. Check DUTY HOURS: projected_duty = current_duty + flight_duration. Must be <= role limit.
+3. Check ROLLING 7-DAY: projected_rolling = rolling_7day + flight_duration. Must be <= role limit.
+4. Check TYPE RATING: Must have rating for aircraft type (Ground Staff EXEMPT).
+5. Check WOCL: If flight departs between 02:00-06:00, flag as night duty concern.
+6. Check CONSECUTIVE NIGHTS: Must not exceed role limit.
+
+ROLE LIMITS:
+- Captain/FO: 12h duty, 35h rolling, 2 consecutive nights
+- Cabin Crew: 14h duty, 45h rolling, 3 consecutive nights  
+- Ground Staff: 10h duty, no rolling limit, no night limit
+
+IMPORTANT: 
+- For STANDBY/REPLACEMENT crew, duty starts when flight departs, NOT when delay is announced
+- Do NOT add delay_hours to the calculation
+- Ground Staff are EXEMPT from type-rating checks
+
+RESPOND IN THIS EXACT JSON FORMAT:
+{
+    "eligible": true or false,
+    "violations": ["specific rule violations only if they exist"],
+    "warnings": ["minor concerns only"],
+    "reasoning": "brief explanation with numbers"
+}"""
+
+    projected_duty = member.current_duty_hours + flight.flight_hours
+    projected_rolling = member.rolling_7_day_hours + flight.flight_hours
+
+    human_prompt = f"""VALIDATE THIS CREW MEMBER:
+
+CREW: {member.name} ({member.role.value})
+- Rest Status: {member.rest_status}
+- Current Duty: {member.current_duty_hours}h
+- Rolling 7-day: {member.rolling_7_day_hours}h
+- Consecutive Nights: {member.consecutive_night_shifts}
+- Type Ratings: {', '.join(q.aircraft_type for q in member.qualifications)}
+
+FLIGHT: {flight.flight_id} ({flight.aircraft_type})
+- Duration: {flight.flight_hours}h
+- Departs: {flight.std.strftime('%H:%M')}
+- Night Duty: {flight.is_night_duty}
+
+CALCULATED VALUES:
+- Projected Duty: {member.current_duty_hours}h + {flight.flight_hours}h = {projected_duty:.1f}h
+- Projected Rolling: {member.rolling_7_day_hours}h + {flight.flight_hours}h = {projected_rolling:.1f}h
+
+VALIDATE: Is {projected_duty:.1f}h <= {MAX_DUTY_HOURS.get(member.role, 12)}h limit? Is {projected_rolling:.1f}h <= {MAX_ROLLING_7_DAY_HOURS.get(member.role, 35)}h limit?
+
+Respond with JSON decision."""
+
+    try:
+        model = ChatOpenAI(
+            model=GROQ_MODEL,
+            api_key=GROQ_API_KEY,
+            base_url=GROQ_BASE_URL,
+            temperature=0.0,
+            request_timeout=10,
+        )
+        response = model.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_prompt),
+        ])
+
+        response_text = response.content
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if json_match:
+            payload = json.loads(json_match.group())
+        else:
+            payload = json.loads(response_text)
+
+        eligible = payload.get("eligible", False)
+        violations = payload.get("violations", [])
+        warnings = payload.get("warnings", [])
+
+        if not eligible and not violations:
+            violations = ["LLM determined crew member is not eligible (no specific violation provided)"]
+
+        return ComplianceResult(
+            eligible=eligible,
+            violations=violations,
+            warnings=warnings,
+        )
+
+    except Exception as e:
+        return ComplianceResult(
+            eligible=False,
+            violations=[f"LLM decision failed: {str(e)[:100]}"],
+            warnings=["Falling back to hardcoded rules"],
+        )
+
+
 def full_compliance_check(
     member: CrewMember,
     flights: Optional[List[Flight]] = None,
     scenario_flight_hours: float = 0.0,
     scenario_is_night_duty: bool = False,
+    use_llm: bool = False,
+    delay_hours: float = 0.0,
 ) -> ComplianceResult:
+    if use_llm and flights:
+        return get_llm_compliance_decision(member, flights[0], delay_hours)
+
     all_violations: List[str] = []
     all_warnings: List[str] = []
 

@@ -7,10 +7,14 @@ from typing import Any, Dict, List, Optional
 from data.crew_loader import load_crew
 from data.flights_db import (
     get_flight, update_flight_status, get_crew_for_flight,
-    unassign_crew_from_flight, get_flight_stats,
+    unassign_crew_from_flight, get_flight_stats, assign_crew_to_flight,
+    is_crew_assigned,
 )
 from data.models import Flight, Role
-from validators.dgca_validator import check_crew_eligibility, MAX_DUTY_HOURS, MAX_ROLLING_7_DAY_HOURS, _limit
+from validators.dgca_validator import (
+    check_crew_eligibility, full_compliance_check, compute_cost,
+    MAX_DUTY_HOURS, MAX_ROLLING_7_DAY_HOURS, _limit,
+)
 
 
 def _update_crew_duty_hours(csv_path: str, crew_id: str, extra_hours: float) -> None:
@@ -51,7 +55,10 @@ def process_delay(
             "status": "success",
             "flight_id": flight_id,
             "delay_minutes": delay_minutes,
+            "delay_hours": delay_hours,
             "crew_impact": [],
+            "unassigned_count": 0,
+            "unassigned_crew": [],
             "message": "Flight delayed. No crew was assigned.",
         }
 
@@ -111,6 +118,89 @@ def process_delay(
     }
 
 
+def analyze_delay_impact(
+    flight_id: str,
+    delay_minutes: int,
+    csv_path: str,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    flight = get_flight(flight_id, db_path)
+    if not flight:
+        return {"status": "error", "message": f"Flight {flight_id} not found."}
+
+    delay_hours = delay_minutes / 60.0
+    assigned = get_crew_for_flight(flight_id, db_path)
+    if not assigned:
+        return {
+            "status": "success",
+            "flight_id": flight_id,
+            "delay_minutes": delay_minutes,
+            "delay_hours": delay_hours,
+            "flight_info": {
+                "origin": flight.origin,
+                "destination": flight.destination,
+                "aircraft_type": flight.aircraft_type,
+                "flight_hours": flight.flight_hours,
+            },
+            "assigned_crew": [],
+            "ineligible_crew": [],
+            "message": "No crew assigned to this flight.",
+        }
+
+    all_crew = load_crew(csv_path)
+    crew_map = {m.crew_id: m for m in all_crew}
+
+    assigned_crew = []
+    ineligible_crew = []
+
+    for assignment in assigned:
+        cid = assignment["crew_id"]
+        member = crew_map.get(cid)
+        if not member:
+            continue
+
+        projected_duty = member.current_duty_hours + flight.flight_hours + delay_hours
+        projected_rolling = member.rolling_7_day_hours + flight.flight_hours + delay_hours
+        max_duty = _limit(MAX_DUTY_HOURS, member.role)
+        max_rolling = _limit(MAX_ROLLING_7_DAY_HOURS, member.role)
+
+        violations = []
+        if projected_duty > max_duty:
+            violations.append(f"Duty {projected_duty:.1f}h > {max_duty:.0f}h limit")
+        if max_rolling != float("inf") and projected_rolling > max_rolling:
+            violations.append(f"Rolling {projected_rolling:.1f}h > {max_rolling:.0f}h limit")
+
+        is_ineligible = len(violations) > 0
+        entry = {
+            "crew_id": cid,
+            "name": member.name,
+            "role": member.role.value,
+            "current_duty": member.current_duty_hours,
+            "projected_duty": round(projected_duty, 1),
+            "duty_limit": max_duty,
+            "violations": violations,
+        }
+
+        assigned_crew.append(entry)
+        if is_ineligible:
+            ineligible_crew.append(entry)
+
+    return {
+        "status": "success",
+        "flight_id": flight_id,
+        "delay_minutes": delay_minutes,
+        "delay_hours": delay_hours,
+        "flight_info": {
+            "origin": flight.origin,
+            "destination": flight.destination,
+            "aircraft_type": flight.aircraft_type,
+            "flight_hours": flight.flight_hours,
+        },
+        "assigned_crew": assigned_crew,
+        "ineligible_crew": ineligible_crew,
+    }
+
+
 def process_cancellation(
     flight_id: str,
     csv_path: str,
@@ -143,83 +233,188 @@ def find_replacement_crew(
     flight_id: str,
     csv_path: str,
     db_path: Optional[Path] = None,
+    use_llm: bool = False,
 ) -> Dict[str, Any]:
-    from data.staff_manager import REQUIRED_CREW
-
     flight = get_flight(flight_id, db_path)
     if not flight:
         return {"status": "error", "message": f"Flight {flight_id} not found."}
 
-    assigned = get_crew_for_flight(flight_id, db_path)
-    assigned_role_counts = {}
-    for a in assigned:
-        role = a["role"]
-        assigned_role_counts[role] = assigned_role_counts.get(role, 0) + 1
-
-    missing = {}
-    for role_name, required_count in REQUIRED_CREW.items():
-        have = assigned_role_counts.get(role_name, 0)
-        if have < required_count:
-            missing[role_name] = required_count - have
-
-    if not missing:
-        return {
-            "status": "success",
-            "flight_id": flight_id,
-            "message": "All roles are fully staffed.",
-            "candidates": {},
-        }
-
     all_crew = load_crew(csv_path)
-    role_map = {
-        "Captain": Role.CAPTAIN,
-        "FO": Role.FO,
-        "CabinCrew": Role.CABIN_CREW,
-        "GroundStaff": Role.GROUND_STAFF,
-    }
-
+    assigned = get_crew_for_flight(flight_id, db_path)
     assigned_ids = {a["crew_id"] for a in assigned}
 
-    candidates = {}
-    for role_name, needed in missing.items():
-        target_role = role_map.get(role_name)
-        role_candidates = []
-        for member in all_crew:
-            if member.crew_id in assigned_ids:
-                continue
-            if member.rest_status.lower() != "legal":
-                continue
-            if member.role != target_role:
-                continue
+    scenario_hours = flight.flight_hours
 
-            eligible = check_crew_eligibility(
+    assigned_crew_details = []
+    eligible_standby = []
+    eligible_assigned_elsewhere = []
+    ineligible = []
+
+    for member in all_crew:
+        basic = full_compliance_check(
+            member,
+            flights=[flight],
+            scenario_flight_hours=scenario_hours,
+            scenario_is_night_duty=flight.is_night_duty,
+            use_llm=False,
+        )
+
+        if use_llm and basic.eligible:
+            result = full_compliance_check(
                 member,
                 flights=[flight],
-                scenario_flight_hours=flight.flight_hours,
+                scenario_flight_hours=scenario_hours,
                 scenario_is_night_duty=flight.is_night_duty,
+                use_llm=True,
             )
-            cost = member.base_cost * member.overtime_multiplier * flight.flight_hours
-            role_candidates.append({
-                "crew_id": member.crew_id,
-                "name": member.name,
-                "role": role_name,
-                "base_airport": member.base_airport,
-                "current_duty": member.current_duty_hours,
-                "rolling_7_day": member.rolling_7_day_hours,
-                "cost": round(cost, 2),
-                "eligible": eligible.eligible,
-                "violations": eligible.violations,
-                "warnings": eligible.warnings,
-            })
+        else:
+            result = basic
+        cost = round(compute_cost(member, scenario_hours), 2)
+        is_on_this_flight = member.crew_id in assigned_ids
+        is_busy_elsewhere = is_crew_assigned(member.crew_id, db_path) and not is_on_this_flight
 
-        role_candidates.sort(key=lambda x: (not x["eligible"], x["cost"]))
-        candidates[role_name] = {
-            "needed": needed,
-            "candidates": role_candidates,
+        entry = {
+            "crew_id": member.crew_id,
+            "name": member.name,
+            "role": member.role.value,
+            "base_airport": member.base_airport,
+            "current_duty_hours": member.current_duty_hours,
+            "rolling_7_day_hours": member.rolling_7_day_hours,
+            "consecutive_night_shifts": member.consecutive_night_shifts,
+            "rest_status": member.rest_status,
+            "qualifications": [q.aircraft_type for q in member.qualifications],
+            "eligible": result.eligible,
+            "violations": result.violations,
+            "warnings": result.warnings,
+            "cost": cost,
         }
+
+        if is_on_this_flight:
+            if not result.eligible:
+                entry["status_label"] = "Assigned - INELIGIBLE"
+            else:
+                entry["status_label"] = "Assigned - Eligible"
+            assigned_crew_details.append(entry)
+        elif result.eligible:
+            if is_busy_elsewhere:
+                entry["status_label"] = "Eligible - Assigned Elsewhere"
+                eligible_assigned_elsewhere.append(entry)
+            else:
+                entry["status_label"] = "Eligible - Standby"
+                eligible_standby.append(entry)
+        else:
+            if is_busy_elsewhere:
+                entry["status_label"] = "Ineligible - Assigned Elsewhere"
+            else:
+                entry["status_label"] = "Ineligible - Standby"
+            ineligible.append(entry)
+
+    eligible_standby.sort(key=lambda x: x["cost"])
 
     return {
         "status": "success",
         "flight_id": flight_id,
-        "candidates": candidates,
+        "flight_info": {
+            "origin": flight.origin,
+            "destination": flight.destination,
+            "aircraft_type": flight.aircraft_type,
+            "flight_hours": flight.flight_hours,
+            "is_night_duty": flight.is_night_duty,
+            "std": flight.std.strftime("%H:%M"),
+        },
+        "assigned_crew": assigned_crew_details,
+        "eligible_standby": eligible_standby,
+        "eligible_assigned_elsewhere": eligible_assigned_elsewhere,
+        "ineligible": ineligible,
+        "summary": {
+            "total_crew": len(all_crew),
+            "assigned_to_flight": len(assigned_crew_details),
+            "eligible_standby_count": len(eligible_standby),
+            "eligible_assigned_elsewhere_count": len(eligible_assigned_elsewhere),
+            "ineligible_count": len(ineligible),
+        },
+    }
+
+
+def _build_rule_basis(delay_minutes: int) -> str:
+    try:
+        from rag_engine import retrieve_legal_guidance
+    except Exception:
+        return (
+            "Replacement crew are ranked using the roster's legal-rest status, duty-hour limits, "
+            "rolling 7-day hour limits, night-duty constraints, and aircraft-type rating checks."
+        )
+
+    query = (
+        "What DGCA duty, rest, and compliance rules should be applied when a flight is delayed and "
+        "replacement crew must be selected from standby staff?"
+    )
+    try:
+        return retrieve_legal_guidance(query)[:900]
+    except Exception:
+        return (
+            "Replacement crew are ranked using the roster's legal-rest status, duty-hour limits, "
+            "rolling 7-day hour limits, night-duty constraints, and aircraft-type rating checks."
+        )
+
+
+def process_delay_with_replacements(
+    flight_id: str,
+    delay_minutes: int,
+    csv_path: str,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    from data.staff_manager import REQUIRED_CREW
+
+    delay_result = process_delay(flight_id, delay_minutes, csv_path, db_path)
+    if delay_result.get("status") != "success":
+        return delay_result
+
+    replacement_result = find_replacement_crew(flight_id, csv_path, db_path)
+    replacement_assignments: List[Dict[str, Any]] = []
+    standby_flags: List[Dict[str, Any]] = []
+    assignment_errors: List[str] = []
+
+    if replacement_result.get("status") == "success":
+        assigned = get_crew_for_flight(flight_id, db_path)
+        assigned_role_counts = {}
+        for a in assigned:
+            role = a["role"]
+            assigned_role_counts[role] = assigned_role_counts.get(role, 0) + 1
+
+        missing = {}
+        for role_name, required_count in REQUIRED_CREW.items():
+            have = assigned_role_counts.get(role_name, 0)
+            if have < required_count:
+                missing[role_name] = required_count - have
+
+        if missing:
+            for c in replacement_result.get("eligible_standby", []):
+                role_name = c.get("role")
+                if role_name in missing and missing[role_name] > 0:
+                    assign_result = assign_crew_to_flight(c["crew_id"], flight_id, role_name, db_path)
+                    if assign_result.get("status") == "success":
+                        replacement_assignments.append({
+                            **c,
+                            "assigned_role": role_name,
+                        })
+                        missing[role_name] -= 1
+                    else:
+                        c["assignment_error"] = assign_result.get("message", "Assignment failed")
+                        standby_flags.append(c)
+                        assignment_errors.append(c["assignment_error"])
+                elif role_name not in missing:
+                    standby_flags.append(c)
+            for c in replacement_result.get("ineligible", []):
+                standby_flags.append(c)
+
+    rule_basis = _build_rule_basis(delay_minutes)
+
+    return {
+        **delay_result,
+        "replacement_plan": replacement_result,
+        "replacement_assignments": replacement_assignments,
+        "standby_flags": standby_flags,
+        "assignment_errors": assignment_errors,
+        "rule_basis": rule_basis,
     }

@@ -6,3 +6,5 @@ __pycache__/
 faiss_index/
 *.faiss
 *.pkl
+credentials.json
+config.py

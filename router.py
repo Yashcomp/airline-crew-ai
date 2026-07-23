@@ -10,6 +10,10 @@ RULE_KEYWORDS = (
     "rule", "rules", "dgca", "fdtl", "regulation",
     "clause", "compliance", "legal", "sop", "policy",
     "union", "training", "recurrency", "rest requirement",
+    "reporting time", "report time", "reporting", "report for duty",
+    "sign on", "sign-on", "duty start", "duty time", "duty period",
+    "check in time", "report time", "rest period", "rest requirement",
+    "flying hour", "flight time limit", "minimum rest",
 )
 
 FLIGHT_KEYWORDS = (
@@ -310,50 +314,70 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
     return RouteDecision(
         intent=intent,
         route=route_map.get(intent, "data"),
-        extraction=payload.get("extraction", {}),
+        extraction=payload.get("extraction") or {},
         confidence=float(payload.get("confidence", 0.8)),
         mode="azure", raw_input=user_input,
     )
 
 
-def _classify_with_ollama(user_input: str) -> RouteDecision:
+def _classify_with_groq(user_input: str) -> RouteDecision:
     try:
-        from langchain_ollama import ChatOllama
+        from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage, SystemMessage
+        from config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
     except ImportError:
         return _classify_with_regex(user_input)
 
-    model = ChatOllama(model="qwen2.5:3b", temperature=0.0, format="json")
-    system_prompt = """You are an airline operations router. Classify the user's intent into ONE of these:
-    1. "Rule_Query": Questions about DGCA rules, regulations, SOPs, policies, or compliance requirements.
-    2. "Data_Query": Questions about crew roster, availability, who is free, crew counts, etc.
-    3. "Flight_Status": Questions about flight schedules, departures, arrivals, delays, or cancellations.
-    4. "Schedule_Disruption": Requests to assign crew for a disrupted/cancelled flight requiring new crew.
-    5. "Compliance_Check": Requests to validate if a specific crew member can fly a specific route.
-    6. "Recovery_Plan": Major disruptions needing full replanning of multiple flights.
-    7. "Delay_Management": Requests to delay a flight by X hours/minutes, or cancel a flight, or check impact of a delay on assigned crew.
-       For Delay_Management, extract: "flight_ids" (list), "delay_minutes" (int or null), "is_cancel" (bool).
-    8. "Staff_Analytics": Questions about staff distribution, shift coverage, understaffing, or staff utilization.
-    9. "Passenger_Flow": Questions about passenger demand, baggage load, connecting passengers, or passenger profiles.
-    10. "Turnaround_Status": Questions about turnaround times, boarding efficiency, ground ops, or gate events.
-    11. "Security_Analytics": Questions about security throughput, screening queues, or security staff performance.
-    12. "Revenue_Analytics": Questions about retail revenue, passenger spend, duty free, or retail demand.
-    13. "Maintenance_Status": Questions about maintenance logs, work orders, defects, or aircraft airworthiness.
+    if not GROQ_API_KEY or GROQ_API_KEY == "your-groq-api-key-here":
+        return _classify_with_regex(user_input)
 
-    For Schedule_Disruption, extract: "scenario_flight_hours" (float), "scenario_is_night_duty" (bool),
-    "required_counts" (dict of role:count), "flight_ids" (list of strings if mentioned).
-    For Flight_Status, extract: "flight_ids" (list), "origin" (string), "destination" (string).
-    For Compliance_Check, extract: "crew_id" (string), "flight_ids" (list).
-    For Staff_Analytics, Passenger_Flow, Turnaround_Status, Security_Analytics, Revenue_Analytics, or Maintenance_Status,
-    extract: "flight_ids" (list if mentioned).
-    Return ONLY JSON with keys: "intent", "extraction", and "confidence"."""
+    model = ChatOpenAI(
+        model=GROQ_MODEL,
+        api_key=GROQ_API_KEY,
+        base_url=GROQ_BASE_URL,
+        temperature=0.0,
+        request_timeout=10,
+    )
+    system_prompt = """You are an airline operations router. Classify user intent into ONE of these exact strings:
+"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check",
+"Delay_Management", "Staff_Analytics", "Passenger_Flow", "Turnaround_Status",
+"Security_Analytics", "Revenue_Analytics", "Maintenance_Status"
+
+IMPORTANT: Handle typos and misspellings. Words like "dela", "delai", "delat", "delayy" all mean "delay". Words like "cancle", "cancel" mean "cancel".
+
+Use "Delay_Management" for ANY delay/cancel action:
+- "delay AI-301 by 2 hours", "delayed by 30 min", "dela by 7 hours", "cancel AI-501"
+
+Use "Flight_Status" ONLY for READ-ONLY flight status queries:
+- "what is the status of AI-301", "show me flight AI-301", "when does AI-301 depart"
+
+Use "Data_Query" for ALL crew/staff/roster queries about flights or people:
+- "AI-901 staff", "AI-301 crew", "who is assigned to AI-501", "show me the crew of AI-701"
+- "give me information about its crew", "what staff are on AI-901"
+- "who is CRW001", "show crew list", "available captains"
+
+Use "Turnaround_Status" ONLY for ground handling operations:
+- "turnaround time for AI-301", "boarding status", "gate event", "baggage handling"
+
+Use "Rule_Query" for regulations, FDTL rules, rest requirements, SOPs, policies.
+
+Use "Compliance_Check" ONLY when validating if a NAMED crew member can fly a specific route.
+
+Use other intents for their specific operational data categories.
+
+Return JSON: {"intent": "...", "extraction": {}, "confidence": 0.9}"""
 
     response = model.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_input),
     ])
     try:
-        payload = json.loads(response.content)
+        response_text = response.content
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if json_match:
+            payload = json.loads(json_match.group())
+        else:
+            payload = json.loads(response_text)
     except Exception:
         return _classify_with_regex(user_input)
 
@@ -376,23 +400,41 @@ def _classify_with_ollama(user_input: str) -> RouteDecision:
     return RouteDecision(
         intent=intent,
         route=route_map.get(intent, "data"),
-        extraction=payload.get("extraction", {}),
+        extraction=payload.get("extraction") or {},
         confidence=float(payload.get("confidence", 0.85)),
-        mode="ollama", raw_input=user_input,
+        mode="groq", raw_input=user_input,
     )
 
 
 def route_request(user_input: str) -> Dict[str, Any]:
+    result = None
     if _has_azure_credentials():
         try:
-            return asdict(_classify_with_azure(user_input))
+            result = asdict(_classify_with_azure(user_input))
         except Exception:
-            pass
-    try:
-        return asdict(_classify_with_ollama(user_input))
-    except Exception:
-        pass
-    return asdict(_classify_with_regex(user_input))
+            result = None
+    if result is None:
+        try:
+            result = asdict(_classify_with_groq(user_input))
+        except Exception:
+            result = None
+    if result is None:
+        result = asdict(_classify_with_regex(user_input))
+
+    extraction = result.get("extraction", {})
+    if not extraction.get("flight_ids"):
+        regex_fids = _extract_flight_ids(user_input)
+        if regex_fids:
+            extraction["flight_ids"] = regex_fids
+    if extraction.get("delay_minutes") is None:
+        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:hour|hours|hrs|hr)", user_input, re.IGNORECASE)
+        min_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:min|minutes|min)", user_input, re.IGNORECASE)
+        if hour_match:
+            extraction["delay_minutes"] = int(float(hour_match.group(1)) * 60)
+        elif min_match:
+            extraction["delay_minutes"] = int(min_match.group(1))
+    result["extraction"] = extraction
+    return result
 
 
 if __name__ == "__main__":
