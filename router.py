@@ -46,40 +46,6 @@ DELAY_MANAGEMENT_KEYWORDS = (
     "how does delay", "impact of delay",
 )
 
-GROUND_OPS_KEYWORDS = (
-    "turnaround", "boarding", "gate event", "ground handling",
-    "baggage", "ramp", "ground staff", "ground ops",
-)
-
-PASSENGER_KEYWORDS = (
-    "passenger", "pax", "demand", "nationality", "connecting",
-    "baggage load", "baggage profile", "baggage prediction",
-    "demand by route", "passenger profile", "passenger demand",
-)
-
-STAFFING_KEYWORDS = (
-    "staffing", "staff distribution", "shift coverage",
-    "understaffed", "staff utilization", "shift analysis",
-    "role distribution", "staff forecast", "staffing need",
-)
-
-SECURITY_KEYWORDS = (
-    "security", "screening", "queue", "xray", "screen type",
-    "security throughput", "queue prediction", "queue buildup",
-    "security staff", "screening staff",
-)
-
-REVENUE_KEYWORDS = (
-    "revenue", "retail", "spend", "duty free", "txn",
-    "retail revenue", "passenger spend", "spend profile",
-    "revenue by flight", "revenue by gate",
-)
-
-MAINTENANCE_KEYWORDS = (
-    "maintenance", "work order", "defect", "airworthy",
-    "aircraft maintenance", "maintenance impact", "maintenance log",
-)
-
 DELAY_MANAGEMENT_PATTERNS = (
     r"delay\b.*?\bby\b",
     r"delayed\b.*?\bby\b",
@@ -168,48 +134,6 @@ def _classify_with_regex(user_input: str) -> RouteDecision:
             intent="Compliance_Check", route="compliance",
             confidence=0.7, mode="regex_fallback", raw_input=user_input,
         )
-    if _contains_any(user_input, SECURITY_KEYWORDS):
-        extraction = {"flight_ids": _extract_flight_ids(user_input)}
-        return RouteDecision(
-            intent="Security_Analytics", route="security",
-            extraction=extraction,
-            confidence=0.75, mode="regex_fallback", raw_input=user_input,
-        )
-    if _contains_any(user_input, REVENUE_KEYWORDS):
-        extraction = {"flight_ids": _extract_flight_ids(user_input)}
-        return RouteDecision(
-            intent="Revenue_Analytics", route="revenue",
-            extraction=extraction,
-            confidence=0.75, mode="regex_fallback", raw_input=user_input,
-        )
-    if _contains_any(user_input, MAINTENANCE_KEYWORDS):
-        extraction = {"flight_ids": _extract_flight_ids(user_input)}
-        return RouteDecision(
-            intent="Maintenance_Status", route="maintenance",
-            extraction=extraction,
-            confidence=0.7, mode="regex_fallback", raw_input=user_input,
-        )
-    if _contains_any(user_input, PASSENGER_KEYWORDS):
-        extraction = {"flight_ids": _extract_flight_ids(user_input)}
-        return RouteDecision(
-            intent="Passenger_Flow", route="passenger",
-            extraction=extraction,
-            confidence=0.75, mode="regex_fallback", raw_input=user_input,
-        )
-    if _contains_any(user_input, STAFFING_KEYWORDS):
-        extraction = {"flight_ids": _extract_flight_ids(user_input)}
-        return RouteDecision(
-            intent="Staff_Analytics", route="staffing",
-            extraction=extraction,
-            confidence=0.75, mode="regex_fallback", raw_input=user_input,
-        )
-    if _contains_any(user_input, GROUND_OPS_KEYWORDS):
-        extraction = {"flight_ids": _extract_flight_ids(user_input)}
-        return RouteDecision(
-            intent="Turnaround_Status", route="ground_ops",
-            extraction=extraction,
-            confidence=0.75, mode="regex_fallback", raw_input=user_input,
-        )
     if _contains_any(user_input, DELAY_MANAGEMENT_KEYWORDS) or any(re.search(p, user_input, re.IGNORECASE) for p in DELAY_MANAGEMENT_PATTERNS):
         delay_minutes = None
         hour_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:hour|hours|hrs|hr)", user_input, re.IGNORECASE)
@@ -278,15 +202,12 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
     )
     prompt = (
         "You are an airline operations router. Classify the user's intent into ONE of: "
-        "Rule_Query, Data_Query, Flight_Status, Schedule_Disruption, Compliance_Check, Recovery_Plan, Delay_Management, "
-        "Staff_Analytics, Passenger_Flow, Turnaround_Status, Security_Analytics, Revenue_Analytics, Maintenance_Status.\n"
+        "Rule_Query, Data_Query, Flight_Status, Schedule_Disruption, Compliance_Check, Delay_Management.\n"
         "If Schedule_Disruption, extract: scenario_flight_hours (float), scenario_is_night_duty (bool), "
         "required_counts (dict), flight_ids (list of strings).\n"
         "If Flight_Status, extract: flight_ids (list), origin (string), destination (string).\n"
         "If Compliance_Check, extract: crew_id (string), flight_ids (list).\n"
         "If Delay_Management, extract: flight_ids (list), delay_minutes (int or null), is_cancel (bool).\n"
-        "If Staff_Analytics, Passenger_Flow, Turnaround_Status, Security_Analytics, Revenue_Analytics, or Maintenance_Status, "
-        "extract: flight_ids (list if mentioned).\n"
         "Return ONLY valid JSON with keys: intent, extraction, confidence.\n\n"
         f"User input: {user_input}"
     )
@@ -302,14 +223,7 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
         "Flight_Status": "flights",
         "Schedule_Disruption": "solver",
         "Compliance_Check": "compliance",
-        "Recovery_Plan": "recovery",
         "Delay_Management": "delay",
-        "Staff_Analytics": "staffing",
-        "Passenger_Flow": "passenger",
-        "Turnaround_Status": "ground_ops",
-        "Security_Analytics": "security",
-        "Revenue_Analytics": "revenue",
-        "Maintenance_Status": "maintenance",
     }
     return RouteDecision(
         intent=intent,
@@ -339,9 +253,7 @@ def _classify_with_groq(user_input: str) -> RouteDecision:
         request_timeout=10,
     )
     system_prompt = """You are an airline operations router. Classify user intent into ONE of these exact strings:
-"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check",
-"Delay_Management", "Staff_Analytics", "Passenger_Flow", "Turnaround_Status",
-"Security_Analytics", "Revenue_Analytics", "Maintenance_Status"
+"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check", "Delay_Management"
 
 IMPORTANT: Handle typos and misspellings. Words like "dela", "delai", "delat", "delayy" all mean "delay". Words like "cancle", "cancel" mean "cancel".
 
@@ -356,14 +268,9 @@ Use "Data_Query" for ALL crew/staff/roster queries about flights or people:
 - "give me information about its crew", "what staff are on AI-901"
 - "who is CRW001", "show crew list", "available captains"
 
-Use "Turnaround_Status" ONLY for ground handling operations:
-- "turnaround time for AI-301", "boarding status", "gate event", "baggage handling"
-
 Use "Rule_Query" for regulations, FDTL rules, rest requirements, SOPs, policies.
 
 Use "Compliance_Check" ONLY when validating if a NAMED crew member can fly a specific route.
-
-Use other intents for their specific operational data categories.
 
 Return JSON: {"intent": "...", "extraction": {}, "confidence": 0.9}"""
 
@@ -388,14 +295,7 @@ Return JSON: {"intent": "...", "extraction": {}, "confidence": 0.9}"""
         "Flight_Status": "flights",
         "Schedule_Disruption": "solver",
         "Compliance_Check": "compliance",
-        "Recovery_Plan": "recovery",
         "Delay_Management": "delay",
-        "Staff_Analytics": "staffing",
-        "Passenger_Flow": "passenger",
-        "Turnaround_Status": "ground_ops",
-        "Security_Analytics": "security",
-        "Revenue_Analytics": "revenue",
-        "Maintenance_Status": "maintenance",
     }
     return RouteDecision(
         intent=intent,

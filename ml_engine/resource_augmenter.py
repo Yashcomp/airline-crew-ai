@@ -144,6 +144,7 @@ def forecast_crew_needs(
     flights_today: int = 10,
     avg_flight_hours: float = 2.0,
     disruption_rate: float = 0.15,
+    today_schedule: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     crew = load_crew(csv_path)
     if not crew:
@@ -155,6 +156,16 @@ def forecast_crew_needs(
         role_counts[m.role.value] = role_counts.get(m.role.value, 0) + 1
         if _availability_score(m) > 0:
             role_available[m.role.value] = role_available.get(m.role.value, 0) + 1
+
+    if today_schedule and len(today_schedule) > 0:
+        ml_disruption_rate = sum(
+            f.get("prediction", {}).get("delay_probability", 0)
+            for f in today_schedule
+        ) / len(today_schedule)
+        disruption_rate = max(ml_disruption_rate, 0.05)
+        flights_today = len(today_schedule)
+        durations = [f.get("avg_duration_min", 120) for f in today_schedule]
+        avg_flight_hours = sum(durations) / len(durations) / 60.0 if durations else avg_flight_hours
 
     total_flight_hours = flights_today * avg_flight_hours
     expected_disruptions = int(flights_today * disruption_rate)

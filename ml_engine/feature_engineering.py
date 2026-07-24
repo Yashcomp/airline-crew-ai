@@ -19,6 +19,7 @@ FEATURE_COLUMNS = [
     "is_peak_hour",
     "route_encoded",
     "route_historical_avg_delay",
+    "route_delay_rate",
     "airport_congestion",
     "prev_flight_delay",
     "aircraft_daily_flights",
@@ -57,6 +58,14 @@ def _compute_route_avg_delay(df: pd.DataFrame) -> pd.Series:
     route_key = df["origin_airport"].fillna("") + "_" + df["destination_airport"].fillna("")
     avg_by_route = df.groupby(route_key)["deviation_min"].transform("mean")
     return avg_by_route.fillna(0)
+
+
+def _compute_route_delay_rate(df: pd.DataFrame) -> pd.Series:
+    if "is_delayed" not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    route_key = df["origin_airport"].fillna("") + "_" + df["destination_airport"].fillna("")
+    rate_by_route = df.groupby(route_key)["is_delayed"].transform("mean")
+    return rate_by_route.fillna(0)
 
 
 def _compute_aircraft_daily_flights(df: pd.DataFrame) -> pd.Series:
@@ -102,6 +111,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         features["route_historical_avg_delay"] = _compute_route_avg_delay(df)
     else:
         features["route_historical_avg_delay"] = 0.0
+
+    if "is_delayed" in df.columns:
+        features["route_delay_rate"] = _compute_route_delay_rate(df)
+    else:
+        features["route_delay_rate"] = 0.0
 
     features["airport_congestion"] = _compute_congestion(df)
     features["prev_flight_delay"] = _compute_prev_flight_delay(df)
@@ -169,6 +183,7 @@ def build_single_flight_features(
     temperature_c: float = 25.0,
     pressure_hpa: float = 1013.0,
     route_avg_delay: float = 0.0,
+    route_delay_rate: float = 0.0,
 ) -> pd.DataFrame:
     data = {
         "hour_of_day": hour_of_day,
@@ -178,6 +193,7 @@ def build_single_flight_features(
         "is_peak_hour": int(hour_of_day in _PEAK_HOURS),
         "route_encoded": hash(route) % 1000,
         "route_historical_avg_delay": route_avg_delay,
+        "route_delay_rate": route_delay_rate,
         "airport_congestion": airport_congestion,
         "prev_flight_delay": prev_delay,
         "aircraft_daily_flights": aircraft_flights_today,

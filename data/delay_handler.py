@@ -418,3 +418,99 @@ def process_delay_with_replacements(
         "assignment_errors": assignment_errors,
         "rule_basis": rule_basis,
     }
+
+
+def proactive_crew_assignment(
+    today_schedule: List[Dict[str, Any]],
+    csv_path: str,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    from data.staff_manager import REQUIRED_CREW
+
+    all_crew = load_crew(csv_path)
+
+    flights_needing_coverage = []
+    standby_alerts = []
+    crew_recommendations = {}
+
+    for flight in today_schedule:
+        pred = flight.get("prediction", {})
+        risk = pred.get("risk_level", "Low")
+        fid = flight.get("callsign", "")
+        exp_delay = pred.get("expected_delay_min", 0)
+
+        if risk not in ("High", "Medium"):
+            continue
+
+        flight_hours = flight.get("avg_duration_min", 120) / 60.0
+        dep_hour = flight.get("avg_departure_hour", 12)
+        is_night = dep_hour < 6 or dep_hour >= 22
+
+        eligible_standby = []
+        for member in all_crew:
+            if member.rest_status.lower() != "legal":
+                continue
+            if member.current_duty_hours >= 11.5:
+                continue
+            result = check_crew_eligibility(
+                member,
+                scenario_flight_hours=flight_hours,
+                scenario_is_night_duty=is_night,
+            )
+            if result.eligible:
+                cost = round(compute_cost(member, flight_hours), 2)
+                eligible_standby.append({
+                    "crew_id": member.crew_id,
+                    "name": member.name,
+                    "role": member.role.value,
+                    "cost": cost,
+                    "rest_status": member.rest_status,
+                    "current_duty_hours": member.current_duty_hours,
+                    "rolling_7_day_hours": member.rolling_7_day_hours,
+                })
+
+        eligible_standby.sort(key=lambda x: x["cost"])
+
+        suggestions = {}
+        for role_name in REQUIRED_CREW:
+            candidates = [c for c in eligible_standby if c.get("role") == role_name]
+            if candidates:
+                best = candidates[0]
+                suggestions[role_name] = {
+                    "crew_id": best["crew_id"],
+                    "name": best["name"],
+                    "cost": best["cost"],
+                    "rest_status": best["rest_status"],
+                    "duty_hours": best["current_duty_hours"],
+                    "rolling_7d": best["rolling_7_day_hours"],
+                }
+
+        rec = {
+            "flight_id": fid,
+            "route": flight.get("route", ""),
+            "scheduled_departure": flight.get("scheduled_departure", ""),
+            "risk_level": risk,
+            "delay_probability": pred.get("delay_probability", 0),
+            "expected_delay_min": exp_delay,
+            "factors": pred.get("factors", []),
+            "suggested_crew": suggestions,
+            "standby_count": len(eligible_standby),
+        }
+
+        crew_recommendations[fid] = rec
+
+        if risk == "High":
+            flights_needing_coverage.append(rec)
+        else:
+            standby_alerts.append(rec)
+
+    return {
+        "flights_needing_coverage": flights_needing_coverage,
+        "standby_alerts": standby_alerts,
+        "crew_recommendations": crew_recommendations,
+        "summary": {
+            "high_risk_count": len(flights_needing_coverage),
+            "medium_risk_count": len(standby_alerts),
+            "low_risk_count": len(today_schedule) - len(flights_needing_coverage) - len(standby_alerts),
+        },
+    }

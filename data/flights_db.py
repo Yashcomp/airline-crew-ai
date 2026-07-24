@@ -183,7 +183,9 @@ def get_upcoming_flights(hours_ahead: int = 6, origin: Optional[str] = None, db_
     now = datetime.now()
     cutoff = now + timedelta(hours=hours_ahead)
     flights = get_flights(db_path=db_path, origin=origin)
-    return [f for f in flights if now <= f.std <= cutoff and f.status not in (FlightStatus.DEPARTED, FlightStatus.LANDED, FlightStatus.CANCELLED)]
+    def _naive(dt):
+        return dt.replace(tzinfo=None) if dt and dt.tzinfo else dt
+    return [f for f in flights if now <= _naive(f.std) <= cutoff and f.status not in (FlightStatus.DEPARTED, FlightStatus.LANDED, FlightStatus.CANCELLED)]
 
 
 def get_flight_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:

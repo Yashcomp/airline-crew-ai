@@ -18,8 +18,8 @@ from validators.dgca_validator import check_crew_eligibility
 REQUIRED_CREW = {
     "Captain": 1,
     "FO": 1,
-    "CabinCrew": 2,
-    "GroundStaff": 1,
+    "CabinCrew": 4,
+    "GroundStaff": 2,
 }
 
 

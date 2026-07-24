@@ -97,6 +97,21 @@ def init_opensky_tables(db_path: Optional[Path] = None) -> None:
         CREATE INDEX IF NOT EXISTS idx_os_flights_callsign ON opensky_flights(callsign);
         CREATE INDEX IF NOT EXISTS idx_os_states_icao ON opensky_states(icao24);
         CREATE INDEX IF NOT EXISTS idx_rc_icao ON rotation_chains(icao24);
+
+        CREATE TABLE IF NOT EXISTS realtime_delays (
+            flight_id TEXT,
+            callsign TEXT PRIMARY KEY,
+            status TEXT,
+            scheduled_departure TEXT,
+            actual_departure INTEGER,
+            delay_minutes INTEGER,
+            last_seen INTEGER,
+            detected_at INTEGER,
+            origin TEXT,
+            destination TEXT,
+            at_risk INTEGER DEFAULT 0,
+            risk_reason TEXT
+        );
     """)
     conn.commit()
     conn.close()
@@ -378,11 +393,22 @@ def poll_live_data(db_path: Optional[Path] = None) -> Dict[str, Any]:
         states = []
         state_count = 0
     deleted = cleanup_old_states(days_to_keep=1, db_path=db_path)
+
+    delay_events = 0
+    try:
+        from data.live_delay_detector import detect_round_trip_delays, store_realtime_delays
+        delays = detect_round_trip_delays(db_path=path)
+        store_realtime_delays(delays, db_path=path)
+        delay_events = len([d for d in delays if d.get("delay_minutes") is not None])
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "live_aircraft": len(states),
         "states_stored": state_count,
         "old_states_cleaned": deleted,
+        "delay_events": delay_events,
         "credits_remaining": client.credits_remaining,
     }
 
@@ -506,6 +532,36 @@ def cleanup_old_states(days_to_keep: int = 1, db_path: Optional[Path] = None) ->
     return deleted
 
 
+def get_states_for_callsigns(
+    callsigns: List[str],
+    hours: int = 2,
+    db_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists() or not callsigns:
+        return pd.DataFrame()
+    conn = _connect(path)
+    cutoff = int(time.time()) - (hours * 3600)
+    placeholders = ",".join("?" for _ in callsigns)
+    try:
+        df = pd.read_sql_query(
+            f"""SELECT icao24, callsign, timestamp, latitude, longitude,
+                       altitude_m, velocity_ms, heading_deg, on_ground,
+                       vertical_rate, flight_id
+                FROM opensky_states
+                WHERE UPPER(callsign) IN ({placeholders})
+                  AND timestamp > ?
+                ORDER BY callsign, timestamp""",
+            conn,
+            params=[c.upper() for c in callsigns] + [cutoff],
+        )
+    except sqlite3.OperationalError:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    return df
+
+
 def get_daily_callsigns(
     min_days: int = 3,
     limit: int = 20,
@@ -564,6 +620,7 @@ def get_filtered_feature_table(
                  ON dl.flight_id = COALESCE(f.flight_id, f.icao24 || '_' || f.first_seen)
                    AND f.origin_airport = dl.origin
                    AND f.destination_airport = dl.destination
+                   AND f.date = dl.date
                LEFT JOIN weather_cache w
                  ON w.timestamp LIKE f.date || '%' || printf('%02d',
                    CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
@@ -629,10 +686,12 @@ def get_flight_schedule(
                 ROUND(AVG(ABS(COALESCE(dl.deviation_min, 0))), 1) as avg_abs_deviation,
                 ROUND(MAX(ABS(COALESCE(dl.deviation_min, 0))), 1) as max_deviation
             FROM opensky_flights f
-            LEFT JOIN delay_labels dl
-                ON dl.flight_id = COALESCE(f.flight_id, f.callsign, f.icao24 || '_' || f.first_seen)
-                AND f.origin_airport = dl.origin
-                AND f.destination_airport = dl.destination
+               LEFT JOIN delay_labels dl
+                 ON dl.flight_id = COALESCE(f.flight_id, f.icao24 || '_' || f.first_seen)
+                   AND f.origin_airport = dl.origin
+                   AND f.destination_airport = dl.destination
+                   AND f.date = dl.date
+                AND f.date = dl.date
             WHERE f.callsign IS NOT NULL AND f.callsign != ''
               AND f.origin_airport IS NOT NULL AND f.destination_airport IS NOT NULL
               AND f.origin_airport != f.destination_airport
@@ -672,6 +731,199 @@ def get_flight_schedule(
     return schedule
 
 
+def get_model_flights_with_status(
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    schedule = get_flight_schedule(limit=20, db_path=db_path)
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return schedule
+
+    icao_map: Dict[str, Dict[str, Any]] = {}
+    conn = _connect(path)
+    try:
+        callsigns = [f["callsign"] for f in schedule]
+        if not callsigns:
+            conn.close()
+            return schedule
+        placeholders = ",".join("?" for _ in callsigns)
+        rows = conn.execute(
+            f"""SELECT callsign, icao24,
+                       MAX(first_seen) as latest_first_seen
+                FROM opensky_flights
+                WHERE callsign IN ({placeholders})
+                GROUP BY callsign""",
+            callsigns,
+        ).fetchall()
+        for r in rows:
+            icao_map[r["callsign"]] = {
+                "icao24": r["icao24"],
+                "latest_first_seen": r["latest_first_seen"],
+            }
+    except sqlite3.OperationalError:
+        pass
+
+    icao24s = list({v["icao24"] for v in icao_map.values() if v.get("icao24")})
+    state_map: Dict[str, List[Dict]] = {}
+    if icao24s:
+        placeholders = ",".join("?" for _ in icao24s)
+        try:
+            rows = conn.execute(
+                f"""SELECT icao24, callsign, timestamp, altitude_m, velocity_ms,
+                           on_ground, vertical_rate
+                    FROM opensky_states
+                    WHERE icao24 IN ({placeholders})
+                    ORDER BY timestamp ASC""",
+                icao24s,
+            ).fetchall()
+            for r in rows:
+                state_map.setdefault(r["icao24"], []).append(dict(r))
+        except sqlite3.OperationalError:
+            pass
+
+    all_rotation: List[Dict] = []
+    try:
+        all_rotation = [dict(r) for r in conn.execute(
+            """SELECT icao24, callsign, origin, destination, date, flight_sequence
+               FROM rotation_chains
+               WHERE origin IS NOT NULL AND destination IS NOT NULL
+               ORDER BY date, icao24, flight_sequence"""
+        ).fetchall()]
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
+    flights_by_date: Dict[str, List[Dict]] = {}
+    for cr in all_rotation:
+        flights_by_date.setdefault(cr["date"], []).append(cr)
+
+    now = int(time.time())
+    today = datetime.now(timezone.utc)
+
+    for flight in schedule:
+        callsign = flight["callsign"]
+        info = icao_map.get(callsign, {})
+        icao24 = info.get("icao24", "")
+        states = state_map.get(icao24, [])
+        orig = flight["origin"]
+        dest = flight["destination"]
+
+        has_return = False
+        return_callsign = ""
+        for _d, day_flights in flights_by_date.items():
+            for cr in day_flights:
+                if cr["origin"] == orig and cr["destination"] == dest:
+                    for later in day_flights:
+                        if (later["flight_sequence"] > cr["flight_sequence"]
+                                and later["origin"] == dest
+                                and later["destination"] == "VOBL"
+                                and later["icao24"] == cr["icao24"]):
+                            has_return = True
+                            return_callsign = later["callsign"] or ""
+                            break
+                if has_return:
+                    break
+            if has_return:
+                break
+
+        if not has_return:
+            for _d, day_flights in flights_by_date.items():
+                for cr in day_flights:
+                    if cr["origin"] == dest and cr["destination"] == orig:
+                        has_return = True
+                        return_callsign = cr["callsign"] or ""
+                        break
+                if has_return:
+                    break
+
+        flight["flight_type"] = "Round-trip" if has_return else "One-way"
+        flight["return_callsign"] = return_callsign
+
+        dep_hour = flight["avg_departure_hour"]
+        dep_minute = flight["avg_departure_minute"]
+        duration = flight["avg_duration_min"]
+
+        scheduled_dep = today.replace(
+            hour=dep_hour, minute=dep_minute, second=0, microsecond=0
+        )
+        scheduled_dep_ts = int(scheduled_dep.timestamp())
+
+        flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
+        flight["scheduled_arrival"] = (
+            scheduled_dep + timedelta(minutes=duration)
+        ).strftime("%H:%M")
+
+        if not states:
+            if now < scheduled_dep_ts:
+                flight["status"] = "Scheduled"
+            else:
+                flight["status"] = "Unknown"
+            flight["delay_minutes"] = None
+            flight["notes"] = ""
+            if has_return:
+                ret_tag = f" ({return_callsign})" if return_callsign else ""
+                flight["notes"] = f"Return leg{ret_tag} likely affected if delayed"
+            continue
+
+        latest = states[-1]
+        on_ground = bool(latest["on_ground"])
+        vel = latest.get("velocity_ms") or 0
+
+        departed_ts = None
+        landed_ts = None
+        for i in range(1, len(states)):
+            prev_st = states[i - 1]
+            curr_st = states[i]
+            if prev_st["on_ground"] and not curr_st["on_ground"] and (curr_st.get("altitude_m") or 0) > 30:
+                departed_ts = curr_st["timestamp"]
+            if not prev_st["on_ground"] and curr_st["on_ground"]:
+                landed_ts = curr_st["timestamp"]
+
+        if landed_ts:
+            flight["status"] = "Landed"
+            landed_dt = datetime.fromtimestamp(landed_ts, tz=timezone.utc)
+            flight["notes"] = f"Landed {landed_dt.strftime('%H:%M')} UTC"
+        elif departed_ts:
+            if on_ground:
+                flight["status"] = "Landed"
+                flight["notes"] = "On ground after flight"
+            else:
+                flight["status"] = "In Air"
+                eta_ts = departed_ts + (duration * 60)
+                eta_dt = datetime.fromtimestamp(eta_ts, tz=timezone.utc)
+                remaining_min = max(0, round((eta_ts - now) / 60))
+                if remaining_min > 0:
+                    flight["notes"] = f"ETA {eta_dt.strftime('%H:%M')} UTC ({remaining_min}min left)"
+                else:
+                    flight["notes"] = f"ETA was {eta_dt.strftime('%H:%M')} UTC"
+        elif on_ground:
+            if vel > 2:
+                flight["status"] = "Taxiing"
+                flight["notes"] = "Departing"
+            else:
+                flight["status"] = "At Gate"
+                if now < scheduled_dep_ts:
+                    mins_to_dep = round((scheduled_dep_ts - now) / 60)
+                    flight["notes"] = f"Departs in {mins_to_dep}min"
+                else:
+                    flight["notes"] = "Awaiting departure"
+        else:
+            flight["status"] = "In Air"
+            flight["notes"] = ""
+
+        if departed_ts:
+            delay = round((departed_ts - scheduled_dep_ts) / 60)
+            flight["delay_minutes"] = delay
+        else:
+            flight["delay_minutes"] = None
+
+        if has_return and flight.get("delay_minutes") and flight["delay_minutes"] > 0:
+            ret_tag = f" ({return_callsign})" if return_callsign else ""
+            flight["notes"] += f" | Return leg{ret_tag} likely delayed too"
+
+    return schedule
+
+
 def get_today_schedule(
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
@@ -705,6 +957,7 @@ def get_today_schedule(
             precipitation_mm=weather.get("precipitation_mm") or 0,
             temperature_c=weather.get("temperature_c") or 25,
             pressure_hpa=weather.get("pressure_hpa") or 1013,
+            delay_rate_pct=flight.get("delay_rate_pct"),
         )
 
         flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
@@ -724,3 +977,97 @@ def get_today_schedule(
         }
 
     return schedule
+
+
+def update_daily_data(
+    days_back: int = 1,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    path = db_path or DEFAULT_DB_PATH
+    result = seed_historical_data(days=days_back, db_path=path)
+
+    labels_added = 0
+    try:
+        labels_added = compute_delay_labels(path)
+    except Exception:
+        pass
+
+    model_result = {"status": "skipped"}
+    try:
+        from ml_engine.delay_predictor import retrain_if_stale
+        model_result = retrain_if_stale(max_age_hours=12, db_path=path)
+    except Exception:
+        pass
+
+    return {
+        "seed": result,
+        "labels_added": labels_added,
+        "model": model_result,
+    }
+
+
+_INDIAN_ICAO_PREFIXES = ("VO", "VA", "VI", "VE", "VY")
+
+
+def sync_opensky_flights_to_db(
+    csv_path: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    from data.flights_db import insert_flight, get_flight
+    from data.models import Flight, FlightStatus
+    from data.staff_manager import auto_assign_flight
+
+    path = db_path or DEFAULT_DB_PATH
+    schedule = get_flight_schedule(limit=20, db_path=path)
+    if not schedule:
+        return {"inserted": 0, "assigned": 0, "message": "No flights in schedule."}
+
+    if csv_path is None:
+        csv_path = str(Path(__file__).parent.parent / "crew_standby_list.csv")
+
+    today = datetime.now()
+    inserted = 0
+    assigned = 0
+    skipped = 0
+
+    for f in schedule:
+        fid = f["callsign"]
+        existing = get_flight(fid, path)
+        if existing:
+            skipped += 1
+            continue
+
+        dep_hour = f["avg_departure_hour"]
+        dep_minute = f["avg_departure_minute"]
+        duration = f["avg_duration_min"]
+        std = today.replace(hour=dep_hour, minute=dep_minute, second=0, microsecond=0)
+
+        dest = f["destination"]
+        is_intl = not any(dest.startswith(p) for p in _INDIAN_ICAO_PREFIXES)
+
+        flight = Flight(
+            flight_id=fid,
+            origin=f["origin"],
+            destination=dest,
+            std=std,
+            aircraft_type="B737",
+            gate="",
+            terminal="",
+            pax_count=0,
+            flight_duration_min=duration,
+            is_international=is_intl,
+        )
+        insert_flight(flight, path)
+        inserted += 1
+
+        result = auto_assign_flight(fid, csv_path, path)
+        if result.get("assigned_count", 0) > 0:
+            assigned += 1
+
+    return {
+        "inserted": inserted,
+        "skipped": skipped,
+        "assigned": assigned,
+        "total": len(schedule),
+        "message": f"Inserted {inserted} flights, assigned crew to {assigned}, skipped {skipped} existing.",
+    }

@@ -224,6 +224,7 @@ def predict_delay(
     precipitation_mm: float = 0.0,
     temperature_c: float = 25.0,
     pressure_hpa: float = 1013.0,
+    delay_rate_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     if departure_time is None:
         departure_time = datetime.now()
@@ -237,15 +238,27 @@ def predict_delay(
     pressure_hpa = float(pressure_hpa or 1013)
 
     route_avg_delay = 0.0
+    route_delay_rate = 0.0
     try:
         _db = sqlite3.connect(str(Path(__file__).parent.parent / "data" / "flights.db"))
         _cur = _db.execute(
-            "SELECT AVG(deviation_min) FROM delay_labels WHERE origin=? AND destination=? AND is_delayed=1",
+            "SELECT AVG(deviation_min) FROM delay_labels WHERE origin=? AND destination=?",
             (origin, destination),
         )
         _row = _cur.fetchone()
         if _row and _row[0] is not None:
             route_avg_delay = float(_row[0])
+
+        if delay_rate_pct is not None:
+            route_delay_rate = float(delay_rate_pct) / 100.0
+        else:
+            _cur2 = _db.execute(
+                "SELECT AVG(CAST(is_delayed AS REAL)) FROM delay_labels WHERE origin=? AND destination=?",
+                (origin, destination),
+            )
+            _row2 = _cur2.fetchone()
+            if _row2 and _row2[0] is not None:
+                route_delay_rate = float(_row2[0])
         _db.close()
     except Exception:
         pass
@@ -264,6 +277,7 @@ def predict_delay(
         temperature_c=temperature_c,
         pressure_hpa=pressure_hpa,
         route_avg_delay=route_avg_delay,
+        route_delay_rate=route_delay_rate,
     )
 
     ml_result = _predict_with_ml(features_df)
@@ -277,10 +291,11 @@ def predict_delay(
 
     prob = result["delay_probability"]
     exp_delay = result["expected_delay_min"]
+    risk_score = prob * exp_delay
     risk_level = "Low"
-    if prob > 0.5 or exp_delay > 45:
+    if risk_score > 25:
         risk_level = "High"
-    elif prob > 0.3 or exp_delay > 20:
+    elif risk_score > 10:
         risk_level = "Medium"
 
     factors = []
