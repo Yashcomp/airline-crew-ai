@@ -16,24 +16,32 @@ from data.flights_db import (
     init_db, get_flights, get_flight,
     get_disrupted_flights, get_upcoming_flights,
     get_flight_stats, get_crew_for_flight,
-    assign_crew_to_flight,
+    assign_crew_to_flight, unassign_crew_from_flight,
 )
 from data.crew_loader import load_crew
 from data.models import FlightStatus
 from agents.flight_agent import answer_flight_query, answer_crew_query
 from agents.crew_agent import find_eligible_crew_for_flight
-from agents.compliance_agent import validate_single_crew, batch_validate
+from agents.compliance_agent import validate_single_crew, batch_validate, get_at_risk_crew
 from ml_engine.resource_augmenter import forecast_crew_needs
 from data.delay_handler import process_delay, process_cancellation, find_replacement_crew
 from data.delay_handler import analyze_delay_impact, proactive_crew_assignment
 from data.opensky_db import (
-    poll_live_data, get_today_schedule, update_daily_data,
+    poll_live_data, get_today_schedule, get_schedule_for_date, update_daily_data,
     get_model_flights_with_status, sync_opensky_flights_to_db,
 )
+from data.staff_manager import REQUIRED_CREW
+from validators.dgca_validator import GROUND_ROLES, check_crew_eligibility
 
 APP_TITLE = "Airline Crew Operations Hub"
 DEFAULT_CSV_PATH = Path(__file__).parent / "crew_standby_list.csv"
 DEFAULT_DB_PATH = Path(__file__).parent / "data" / "flights.db"
+
+
+def _get_crew_shift_lookup(csv_path=None):
+    path = csv_path or str(DEFAULT_CSV_PATH)
+    crew = load_crew(path)
+    return {m.crew_id: m.shift for m in crew if m.shift}
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -151,7 +159,7 @@ def _groq_rag_chat(question: str) -> str:
     system_prompt += (
         "When asked about delays, check the assigned crew's duty hours and rolling 7-day hours "
         "against DGCA limits (Captain/FO: 12h duty, 35h rolling; CabinCrew: 14h duty, 45h rolling; "
-        "GroundStaff: 10h duty). Flag any violations and suggest replacements from the standby crew list.\n"
+        "Ground staff (RampAgent/BaggageHandler/CabinCleaner/CheckinAgent/SecurityAgent): 10h duty, no rolling limit). Flag any violations and suggest replacements from the standby crew list.\n"
         "When asked about a specific flight, provide its route, schedule, delay risk, and assigned crew.\n"
         "When asked about crew availability, list crew members who are LEGAL (rested) and not assigned to any flight."
     )
@@ -166,9 +174,9 @@ def _groq_rag_chat(question: str) -> str:
         return "Error connecting to AI service: %s" % str(e)
 
 
-# === 4 MAIN TABS ===
-tab_chat, tab_ops, tab_forecast, tab_live = st.tabs([
-    "Chat", "Operations", "Forecasting", "Live Tracking",
+# === 5 MAIN TABS ===
+tab_chat, tab_ops, tab_forecast, tab_live, tab_planning = st.tabs([
+    "Chat", "Operations", "Forecasting", "Live Tracking", "Planning",
 ])
 
 
@@ -833,10 +841,13 @@ with tab_ops:
                     if assigned:
                         st.write("**Assigned Crew:**")
                         crew_data = []
+                        shift_lookup = _get_crew_shift_lookup()
                         for a in assigned:
+                            cid = a["crew_id"]
                             crew_data.append({
-                                "ID": a["crew_id"],
+                                "ID": cid,
                                 "Role": a["role"],
+                                "Shift": shift_lookup.get(cid, ""),
                                 "Status": a.get("status", "assigned"),
                             })
                         st.dataframe(pd.DataFrame(crew_data), hide_index=True)
@@ -896,11 +907,14 @@ with tab_ops:
                 assigned = flight_crew_map[sel_fid]
                 if assigned:
                     crew_rows = []
+                    shift_lookup = _get_crew_shift_lookup()
                     for a in assigned:
+                        cid = a["crew_id"]
                         crew_rows.append({
-                            "Crew ID": a["crew_id"],
-                            "Name": name_map.get(a["crew_id"], "Unknown"),
+                            "Crew ID": cid,
+                            "Name": name_map.get(cid, "Unknown"),
                             "Job": a["role"],
+                            "Shift": shift_lookup.get(cid, ""),
                             "Status": a.get("status", "assigned"),
                         })
                     st.dataframe(pd.DataFrame(crew_rows), use_container_width=True, hide_index=True)
@@ -919,6 +933,7 @@ with tab_ops:
                     "Crew ID": standby_df["crew_id"],
                     "Name": standby_df["name"],
                     "Job": standby_df["role"],
+                    "Shift": standby_df.get("shift", ""),
                     "Base": standby_df["base_airport"],
                     "Rest Status": standby_df["rest_status"],
                     "Duty Hours": standby_df["current_duty_hours"],
@@ -943,8 +958,10 @@ with tab_ops:
                     assigned = get_crew_for_flight(f.flight_id, DEFAULT_DB_PATH)
                     if assigned:
                         st.write(f"**Assigned Crew ({len(assigned)}):**")
+                        shift_lookup = _get_crew_shift_lookup()
                         for a in assigned:
-                            st.write(f"  - {a['crew_id']} ({a['role']})")
+                            shift_info = f" | Shift: {shift_lookup.get(a['crew_id'], '')}" if a['crew_id'] in shift_lookup else ""
+                            st.write(f"  - {a['crew_id']} ({a['role']}){shift_info}")
                     if st.button(f"Find replacement crew for {f.flight_id}", key=f"find_{f.flight_id}"):
                         result = find_eligible_crew_for_flight(f.flight_id, str(DEFAULT_CSV_PATH))
                         if "error" not in result:
@@ -1006,47 +1023,62 @@ with tab_forecast:
     st.subheader("Daily Briefing — BLR Flights")
     st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments.")
 
-    col_init, col_brief = st.columns(2)
-    with col_init:
-        sys_ready = st.session_state.get("system_initialized", False)
-        flight_cnt = st.session_state.get("flight_count", 0)
-        if sys_ready:
-            st.button(
-                "Initialize System (one-time)",
-                disabled=True,
-                help=f"Already loaded — {flight_cnt} flights and ML model found on disk. No API calls needed.",
+    from data.opensky_db import get_flight_stats as get_opensky_stats
+    _os_stats = get_opensky_stats(DEFAULT_DB_PATH)
+    if _os_stats.get("total_flights", 0) > 0:
+        _dr = _os_stats.get("date_range")
+        if _dr and _dr[0] and _dr[1]:
+            _d0 = datetime.strptime(_dr[0], "%Y-%m-%d").date()
+            _d1 = datetime.strptime(_dr[1], "%Y-%m-%d").date()
+            _n_days = (_d1 - _d0).days + 1
+            st.info(
+                f"**{_n_days}** days of data | "
+                f"**{_os_stats['total_flights']}** flights | "
+                f"**{_os_stats.get('weather_records', 0)}** weather records | "
+                f"{_dr[0]} to {_dr[1]}"
             )
         else:
-            if st.button("Initialize System (one-time)", help="Seeds 7 days of historical OpenSky data and trains the XGBoost model. Run this first time only."):
-                with st.spinner("Seeding 7 days of flight data (~3 min)..."):
-                    update_result = update_daily_data(days_back=7, db_path=DEFAULT_DB_PATH)
-                with st.spinner("Syncing flights and assigning crew..."):
-                    sync_result = sync_opensky_flights_to_db(
-                        csv_path=str(DEFAULT_CSV_PATH), db_path=DEFAULT_DB_PATH
-                    )
-                seed_r = update_result["seed"]
-                st.session_state["system_initialized"] = True
-                st.session_state["flight_count"] = seed_r["total_flights"]
-                st.success(
-                    f"Seeded {seed_r['total_flights']} flights, "
-                    f"{seed_r['total_weather_records']} weather records. "
-                    f"Labels: {update_result['labels_added']}. "
-                    f"Model: {update_result['model'].get('status', 'unknown')}. "
-                    f"{sync_result['message']}"
+            st.info(f"**{_os_stats['total_flights']}** flights stored")
+
+    col_seed, col_brief = st.columns(2)
+    with col_seed:
+        seed_days = st.slider("Days to seed", 1, 60, 30, key="seed_days",
+                              help="Fetch historical flight data from OpenSky. Existing days are skipped automatically.")
+        if st.button(f"Seed {seed_days} days of data", help="Seeds OpenSky data, recomputes delay labels and rotation chains."):
+            with st.spinner(f"Fetching {seed_days} days of flight data..."):
+                update_result = update_daily_data(days_back=seed_days, db_path=DEFAULT_DB_PATH)
+            with st.spinner("Syncing flights and assigning crew..."):
+                sync_result = sync_opensky_flights_to_db(
+                    csv_path=str(DEFAULT_CSV_PATH), db_path=DEFAULT_DB_PATH
                 )
-                st.rerun()
+            seed_r = update_result["seed"]
+            new_flights = seed_r["total_flights"]
+            skipped = seed_r["days_skipped"]
+            actual = seed_days - skipped
+            st.session_state["system_initialized"] = True
+            st.session_state["flight_count"] = seed_r["total_flights"]
+            st.success(
+                f"**{new_flights}** flights from **{actual}** new days "
+                f"({skipped} days already stored). "
+                f"Labels: {update_result['labels_added']}. "
+                f"{sync_result['message']}"
+            )
+            st.rerun()
     with col_brief:
-        if st.button("Run Daily Briefing", type="primary", help="Seeds yesterday's data, retrains if stale, predicts delays, suggests crew."):
+        if st.button("Run Daily Briefing", type="primary", help="Seeds yesterday's data, predicts delays, suggests crew."):
             with st.spinner("Updating data + predicting delays + finding crew..."):
                 update_result = update_daily_data(days_back=1, db_path=DEFAULT_DB_PATH)
                 today_flights = get_today_schedule(db_path=DEFAULT_DB_PATH)
                 crew_plan = proactive_crew_assignment(today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
+                at_risk = get_at_risk_crew(str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
             st.session_state["today_flights"] = today_flights
             st.session_state["crew_plan"] = crew_plan
+            st.session_state["at_risk_crew"] = at_risk
             st.rerun()
 
     today_flights = st.session_state.get("today_flights", [])
     crew_plan = st.session_state.get("crew_plan", {})
+    at_risk = st.session_state.get("at_risk_crew", {})
 
     if today_flights:
         high = [f for f in today_flights if f["prediction"]["risk_level"] == "High"]
@@ -1074,6 +1106,8 @@ with tab_forecast:
             st.subheader("Flights Requiring Attention")
 
             recs = crew_plan.get("crew_recommendations", {})
+            crew_name_df = pd.read_csv(DEFAULT_CSV_PATH)
+            crew_name_map = dict(zip(crew_name_df["crew_id"], crew_name_df["name"]))
             for f in high_med:
                 pred = f["prediction"]
                 risk_color = "red" if pred["risk_level"] == "High" else "orange"
@@ -1081,45 +1115,108 @@ with tab_forecast:
                 fid = f["callsign"]
                 rec = recs.get(fid, {})
                 suggestions = rec.get("suggested_crew", {})
+                leg_type = f.get("leg_type", "First Leg")
+                crew_action = f.get("crew_action", "")
 
                 with st.container():
+                    leg_badge = ":blue[First Leg]" if leg_type == "First Leg" else ":green[Return Leg]"
                     st.markdown(
                         f"**{fid}** | {f['scheduled_departure']} | "
                         f"**{f['route']}** | {f['avg_duration_min']}min | "
                         f":{risk_color}[**{pred['risk_level']}**] "
                         f"Delay prob: **{pred['delay_probability']*100:.0f}%** | "
-                        f"Expected delay: **{pred['expected_delay_min']:.0f} min**"
+                        f"Expected delay: **{pred['expected_delay_min']:.0f} min** | "
+                        f"{leg_badge}"
                     )
+
+                    if crew_action:
+                        if leg_type == "Return Leg":
+                            st.info(f"**{crew_action}**")
+                        else:
+                            st.warning(f"**{crew_action}**")
+
+                    if at_risk:
+                        assigned_crew = get_crew_for_flight(fid, DEFAULT_DB_PATH)
+                        at_risk_lookup = {}
+                        for entry in at_risk.get("violating", []) + at_risk.get("critical", []) + at_risk.get("warnings", []):
+                            at_risk_lookup[entry["crew_id"]] = entry
+                        flagged = []
+                        for ac in assigned_crew:
+                            cid = ac.get("crew_id", "")
+                            if cid in at_risk_lookup:
+                                flagged.append((cid, ac.get("role", ""), at_risk_lookup[cid]))
+                        if flagged:
+                            for cid, role, entry in flagged:
+                                sev = entry["severity"]
+                                icon = ":red[!]" if sev == "violating" else ":orange[!]" if sev == "critical" else ":blue[!]"
+                                checks_str = "; ".join(c["metric"] for c in entry["checks"])
+                                sug = suggestions.get(role)
+                                if sug:
+                                    sug_tier = sug.get("tier", 0)
+                                    sug_tag = ":green[Standby]" if sug_tier == 0 else f":orange[On {sug.get('assigned_flight', '')}]"
+                                    st.markdown(f"{icon} **{cid}** ({role}) — {checks_str} → Replace with **{sug['name']}** ({sug['crew_id']}, {sug_tag}, Duty {sug['duty_hours']}h)")
+                                else:
+                                    st.markdown(f"{icon} **{cid}** ({role}) — {checks_str} → :warning[No replacement available]")
 
                     col_wx, col_hist = st.columns(2)
                     col_wx.caption(f"Weather: {wx.get('temp_c', '?')}C, Wind {wx.get('wind_kmh', '?')}km/h, Precip {wx.get('precipitation_mm', 0)}mm")
                     col_hist.caption(f"History: {f['delay_rate_pct']}% delay rate, avg deviation {f['avg_deviation_min']}min across {f['total_flights']} flights")
 
                     if suggestions:
-                        st.markdown("**Suggested Backup Crew (DGCA-Compliant):**")
-                        sug_cols = st.columns(len(suggestions))
-                        for i, (role_name, sug) in enumerate(suggestions.items()):
-                            with sug_cols[i]:
-                                st.markdown(
-                                    f"**{role_name}**: {sug['name']}\n"
-                                    f"Rest: {sug['rest_status']} | Duty: {sug['duty_hours']}h | "
-                                    f"Rolling 7d: {sug['rolling_7d']}h"
-                                )
-                        if st.button(f"Assign suggested crew to {fid}", key=f"assign_{fid}"):
+                        current_crew = get_crew_for_flight(fid, DEFAULT_DB_PATH)
+                        current_by_role = {}
+                        for ac in current_crew:
+                            r = ac.get("role", "")
+                            if r not in current_by_role:
+                                current_by_role[r] = []
+                            current_by_role[r].append(ac)
+
+                        replacement_lines = []
+                        for role_name, sug in suggestions.items():
+                            holders = current_by_role.get(role_name, [])
+                            old_cid = holders[0]["crew_id"] if holders else None
+                            old_name = crew_name_map.get(old_cid, old_cid) if old_cid else "(unassigned)"
+                            replacement_lines.append(f"**{role_name}**: {old_name} → **{sug['name']}** ({sug['crew_id']})")
+
+                        if replacement_lines:
+                            with st.expander(f"Replacement plan for **{fid}**", expanded=False):
+                                for line in replacement_lines:
+                                    st.markdown(f"• {line}")
+
+                        n_roles = len(suggestions)
+                        btn_label = f"Replace {n_roles} crew on {fid}" if n_roles > 1 else f"Replace crew on {fid}"
+                        if st.button(btn_label, key=f"assign_{fid}"):
                             assigned_any = False
+                            already_assigned_count = 0
+                            failed_count = 0
+                            reassigned_count = 0
                             for role_name, sug in suggestions.items():
+                                old_flight = sug.get("assigned_flight", "")
+                                if old_flight:
+                                    unassign_crew_from_flight(sug["crew_id"], old_flight, DEFAULT_DB_PATH)
+                                    reassigned_count += 1
                                 ar = assign_crew_to_flight(sug["crew_id"], fid, role_name, DEFAULT_DB_PATH)
                                 if ar.get("status") == "success":
                                     assigned_any = True
+                                elif "already assigned" in ar.get("message", "").lower():
+                                    already_assigned_count += 1
+                                else:
+                                    failed_count += 1
                             if assigned_any:
-                                st.success(f"Crew assigned to {fid}")
+                                msg_lines = [f"**{fid}** crew updated:"]
+                                for line in replacement_lines:
+                                    msg_lines.append(f"• {line}")
+                                msg = "\n".join(msg_lines)
+                                if reassigned_count:
+                                    msg += f"\n\n({reassigned_count} reassigned from other flights)"
+                                st.success(msg)
                                 st.rerun()
+                            elif already_assigned_count > 0:
+                                st.warning(f"{already_assigned_count} crew already assigned to {fid}. Check if backup is actually needed.")
                             else:
-                                st.error("Assignment failed — crew may have DGCA violations.")
+                                st.error(f"Assignment failed for {failed_count} crew. They may have DGCA violations.")
                     elif rec.get("standby_count", 0) == 0:
-                        st.warning("No eligible standby crew available for this flight.")
-                    else:
-                        st.info(f"{rec.get('standby_count', 0)} standby crew available but none matched required roles.")
+                        st.warning("No DGCA-compliant crew available for this flight. All crew may be on High-risk flights or violate duty limits.")
 
                     st.divider()
 
@@ -1133,6 +1230,7 @@ with tab_forecast:
                 "Time": f["scheduled_departure"],
                 "Route": f["route"],
                 "Duration": f"{f['avg_duration_min']}min",
+                "Leg": f.get("leg_type", "First Leg"),
                 "Weather": f"{wx.get('temp_c', '?')}C {wx.get('wind_kmh', '?')}km/h",
                 "Risk": pred["risk_level"],
                 "Delay Prob": f"{pred['delay_probability']*100:.0f}%",
@@ -1283,3 +1381,179 @@ with tab_live:
         else:
             remaining = 300 - int(time.time() - st.session_state.last_poll)
             st.caption(f"Auto-refresh in {remaining}s")
+
+
+# ============================================================
+# TAB 5: PLANNING (Advance Crew Allocation)
+# ============================================================
+with tab_planning:
+    from datetime import date as date_type
+    st.header("Planning — Advance Crew Allocation")
+    now_utc = datetime.utcnow()
+    st.caption(f"Current date/time: {now_utc.strftime('%a %Y-%m-%d %H:%M')} UTC")
+
+    today = date_type.today()
+    max_date = today + timedelta(days=16)
+
+    selected_date = st.date_input(
+        "Select a date to plan for",
+        value=today,
+        min_value=today,
+        max_value=max_date,
+    )
+
+    if selected_date:
+        days_ahead = (selected_date - today).days
+        if days_ahead == 0:
+            st.info("This is today. Use the **Forecasting** tab for the full Daily Briefing with crew assignment.")
+        else:
+            st.caption(f"Planning {days_ahead} day(s) ahead — weather forecast available via Open-Meteo.")
+
+        with st.spinner(f"Predicting delays for {selected_date}..."):
+            try:
+                planned_flights = get_schedule_for_date(selected_date, db_path=DEFAULT_DB_PATH)
+            except Exception as e:
+                st.error(f"Failed to generate schedule: {e}")
+                planned_flights = []
+
+        if planned_flights:
+            high = [f for f in planned_flights if f["prediction"]["risk_level"] == "High"]
+            med = [f for f in planned_flights if f["prediction"]["risk_level"] == "Medium"]
+            low = [f for f in planned_flights if f["prediction"]["risk_level"] == "Low"]
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Flights", len(planned_flights))
+            c2.metric("High Risk", len(high), delta=f"{len(high)} need backup crew", delta_color="inverse" if high else "off")
+            c3.metric("Medium Risk", len(med), delta=f"{len(med)} on standby alert", delta_color="inverse" if med else "off")
+            c4.metric("Low Risk", len(low))
+
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            st.caption(f"Day of week: **{day_names[selected_date.weekday()]}** — predictions based on historical delay patterns for this day")
+
+            if high or med:
+                st.divider()
+                st.subheader("Crew Required by Role")
+
+                high_count = len(high)
+                med_count = len(med)
+                total_high_med = high_count + med_count
+
+                crew_breakdown = []
+                for role_name, per_flight in REQUIRED_CREW.items():
+                    high_needed = high_count * per_flight
+                    med_needed = med_count * per_flight
+                    total_needed = high_needed + med_needed
+                    category = "Pilots" if role_name in ("Captain", "FO") else \
+                               "Cabin Crew" if role_name == "CabinCrew" else \
+                               "Ground — Ramp" if role_name == "RampAgent" else \
+                               "Ground — Baggage" if role_name == "BaggageHandler" else \
+                               "Ground — Cleaning" if role_name == "CabinCleaner" else \
+                               "Ground — Check-in" if role_name == "CheckinAgent" else \
+                               "Ground — Security"
+                    crew_breakdown.append({
+                        "Category": category,
+                        "Role": role_name,
+                        "Per Flight": per_flight,
+                        "High Risk (x{})".format(high_count): high_needed,
+                        "Medium Risk (x{})".format(med_count): med_needed,
+                        "Total Needed": total_needed,
+                    })
+
+                st.dataframe(pd.DataFrame(crew_breakdown), use_container_width=True, hide_index=True)
+
+                total_all = sum(r["Total Needed"] for r in crew_breakdown)
+                st.metric("Total Standby Crew Needed", total_all,
+                          help="Sum of all roles across High and Medium risk flights.")
+
+                st.divider()
+                st.subheader("Ground Staff Shift Availability")
+
+                _SHIFT_WINDOWS = {"Morning": (6, 14), "Evening": (14, 22), "Night": (22, 6)}
+                all_crew = load_crew(str(DEFAULT_CSV_PATH))
+                ground_by_role_shift = {}
+                for member in all_crew:
+                    if member.role in GROUND_ROLES:
+                        role_val = member.role.value
+                        shift = member.shift or "Unassigned"
+                        ground_by_role_shift.setdefault(role_val, {}).setdefault(shift, 0)
+                        ground_by_role_shift[role_val][shift] += 1
+
+                ground_roles_list = ["RampAgent", "BaggageHandler", "CabinCleaner", "CheckinAgent", "SecurityAgent"]
+                shift_names = ["Morning", "Evening", "Night", "Unassigned"]
+                shift_grid = []
+                for role_val in ground_roles_list:
+                    row = {"Role": role_val}
+                    for sn in shift_names:
+                        row[sn] = ground_by_role_shift.get(role_val, {}).get(sn, 0)
+                    shift_grid.append(row)
+                st.dataframe(pd.DataFrame(shift_grid), use_container_width=True, hide_index=True)
+
+                shift_desc = " | ".join(f"**{s}** {h[0]:02d}:00-{h[1]:02d}:00" for s, h in _SHIFT_WINDOWS.items())
+                st.caption(f"Shift windows (UTC): {shift_desc}")
+
+                st.divider()
+                st.subheader("Flight-Shift Mapping")
+
+                def _get_shift_name(dep_hour):
+                    if 6 <= dep_hour < 14:
+                        return "Morning"
+                    elif 14 <= dep_hour < 22:
+                        return "Evening"
+                    else:
+                        return "Night"
+
+                fs_data = []
+                for f in high + med:
+                    dep_h = f.get("avg_departure_hour", 12)
+                    dep_m = f.get("avg_departure_minute", 0)
+                    shift_name = _get_shift_name(dep_h)
+                    pred = f["prediction"]
+                    fs_data.append({
+                        "Flight": f["callsign"],
+                        "Route": f["route"],
+                        "Departure": f"{dep_h:02d}:{dep_m:02d}",
+                        "Shift": shift_name,
+                        "Risk": pred["risk_level"],
+                        "Delay Prob": f"{pred['delay_probability']*100:.0f}%",
+                        "Factors": "; ".join(pred.get("factors", [])[:2]),
+                    })
+                if fs_data:
+                    fs_df = pd.DataFrame(fs_data)
+                    st.dataframe(fs_df, use_container_width=True, hide_index=True)
+
+                    for f in high + med:
+                        dep_h = f.get("avg_departure_hour", 12)
+                        shift_name = _get_shift_name(dep_h)
+                        avail_ground = sum(
+                            ground_by_role_shift.get(r, {}).get(shift_name, 0)
+                            for r in ground_roles_list
+                        )
+                        needed_ground = sum(REQUIRED_CREW.get(r, 0) for r in ground_roles_list)
+                        fid = f["callsign"]
+                        risk = f["prediction"]["risk_level"]
+                        if avail_ground < needed_ground:
+                            st.warning(f"{fid} ({risk}) — {shift_name} shift: only {avail_ground} ground staff available, need {needed_ground}")
+                        else:
+                            st.success(f"{fid} ({risk}) — {shift_name} shift: {avail_ground} ground staff available, {needed_ground} needed")
+
+            st.divider()
+            st.subheader("All Flights")
+            all_data = []
+            for f in planned_flights:
+                pred = f["prediction"]
+                dep_h = f.get("avg_departure_hour", 12)
+                all_data.append({
+                    "Flight": f["callsign"],
+                    "Route": f["route"],
+                    "Time": f["scheduled_departure"],
+                    "Duration": f"{f['avg_duration_min']}min",
+                    "Leg": f.get("leg_type", "First Leg"),
+                    "Shift": _get_shift_name(dep_h),
+                    "Risk": pred["risk_level"],
+                    "Delay Prob": f"{pred['delay_probability']*100:.0f}%",
+                    "Expected Delay": f"{pred['expected_delay_min']:.0f}min",
+                    "History": f"{f['delay_rate_pct']}% delayed ({f['total_flights']} flights)",
+                })
+            st.dataframe(pd.DataFrame(all_data), use_container_width=True, hide_index=True)
+        else:
+            st.warning("No flights found for this date.")

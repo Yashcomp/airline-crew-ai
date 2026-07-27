@@ -148,8 +148,9 @@ def answer_crew_query(question: str, csv_path: Optional[str] = None) -> str:
         return f"**{len(cabin)} Cabin Crew:**\n" + "\n".join(lines)
 
     if "ground" in lowered:
-        ground = [m for m in crew if m.role == Role.GROUND_STAFF]
-        lines = [f"{m.name} ({m.crew_id}): {m.current_duty_hours}h duty, rest={m.rest_status}" for m in ground]
+        ground_roles = {Role.RAMP_AGENT, Role.BAGGAGE_HANDLER, Role.CABIN_CLEANER, Role.CHECKIN_AGENT, Role.SECURITY_AGENT, Role.GROUND_STAFF}
+        ground = [m for m in crew if m.role in ground_roles]
+        lines = [f"{m.name} ({m.crew_id}): {m.role.value}, {m.current_duty_hours}h duty, rest={m.rest_status}" for m in ground]
         return f"**{len(ground)} Ground Staff:**\n" + "\n".join(lines)
 
     if "illegal" in lowered or "unavailable" in lowered:

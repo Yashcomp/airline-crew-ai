@@ -18,8 +18,6 @@ FEATURE_COLUMNS = [
     "is_weekend",
     "is_peak_hour",
     "route_encoded",
-    "route_historical_avg_delay",
-    "route_delay_rate",
     "airport_congestion",
     "prev_flight_delay",
     "aircraft_daily_flights",
@@ -30,6 +28,13 @@ FEATURE_COLUMNS = [
     "precipitation_mm",
     "temperature_c",
     "pressure_hpa",
+    "weather_severity",
+    "wind_severity",
+    "has_rain",
+    "has_high_wind",
+    "has_low_visibility",
+    "wind_cloud_interaction",
+    "wind_precip_interaction",
 ]
 
 TARGET_BINARY = "is_delayed"
@@ -45,6 +50,10 @@ def _compute_route_encoded(df: pd.DataFrame) -> pd.Series:
     return routes.map(route_map).fillna(-1).astype(int)
 
 
+def _compute_route_labels(df: pd.DataFrame) -> pd.Series:
+    return (df["origin_airport"].fillna("") + "_" + df["destination_airport"].fillna(""))
+
+
 def _compute_congestion(df: pd.DataFrame) -> pd.Series:
     if "first_seen" not in df.columns:
         return pd.Series(0, index=df.index)
@@ -52,20 +61,6 @@ def _compute_congestion(df: pd.DataFrame) -> pd.Series:
     hour_key = ts.dt.floor("h")
     counts = hour_key.groupby(hour_key).transform("count")
     return counts.fillna(0).astype(int)
-
-
-def _compute_route_avg_delay(df: pd.DataFrame) -> pd.Series:
-    route_key = df["origin_airport"].fillna("") + "_" + df["destination_airport"].fillna("")
-    avg_by_route = df.groupby(route_key)["deviation_min"].transform("mean")
-    return avg_by_route.fillna(0)
-
-
-def _compute_route_delay_rate(df: pd.DataFrame) -> pd.Series:
-    if "is_delayed" not in df.columns:
-        return pd.Series(0.0, index=df.index)
-    route_key = df["origin_airport"].fillna("") + "_" + df["destination_airport"].fillna("")
-    rate_by_route = df.groupby(route_key)["is_delayed"].transform("mean")
-    return rate_by_route.fillna(0)
 
 
 def _compute_aircraft_daily_flights(df: pd.DataFrame) -> pd.Series:
@@ -84,6 +79,25 @@ def _compute_prev_flight_delay(df: pd.DataFrame) -> pd.Series:
 
 def _compute_wind_knots(kmh: pd.Series) -> pd.Series:
     return kmh.fillna(0) * 0.539957
+
+
+def _compute_weather_severity(features: pd.DataFrame) -> pd.Series:
+    severity = pd.Series(0.0, index=features.index)
+    severity += (features["wind_speed_knots"] / 30).clip(0, 1) * 0.3
+    severity += (features["precipitation_mm"] / 10).clip(0, 1) * 0.3
+    severity += ((10000 - features["visibility_m"]).clip(0, 10000) / 10000) * 0.2
+    severity += (features["cloud_cover_pct"] / 100) * 0.2
+    return severity
+
+
+def _compute_wind_severity(features: pd.DataFrame) -> pd.Series:
+    wind = features["wind_speed_knots"]
+    severity = pd.Series(0.0, index=features.index)
+    severity = severity.where(wind <= 15, 1.0)
+    severity = severity.where(wind <= 25, 2.0)
+    severity = severity.where(wind <= 35, 3.0)
+    severity = severity.where(wind <= 45, 4.0)
+    return severity
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -107,16 +121,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     features["route_encoded"] = _compute_route_encoded(df)
 
-    if "deviation_min" in df.columns:
-        features["route_historical_avg_delay"] = _compute_route_avg_delay(df)
-    else:
-        features["route_historical_avg_delay"] = 0.0
-
-    if "is_delayed" in df.columns:
-        features["route_delay_rate"] = _compute_route_delay_rate(df)
-    else:
-        features["route_delay_rate"] = 0.0
-
     features["airport_congestion"] = _compute_congestion(df)
     features["prev_flight_delay"] = _compute_prev_flight_delay(df)
     features["aircraft_daily_flights"] = _compute_aircraft_daily_flights(df)
@@ -133,6 +137,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     features["temperature_c"] = df.get("temperature_c", pd.Series(25, index=df.index)).fillna(25)
     features["pressure_hpa"] = df.get("pressure_hpa", pd.Series(1013, index=df.index)).fillna(1013)
 
+    features["weather_severity"] = _compute_weather_severity(features)
+    features["wind_severity"] = _compute_wind_severity(features)
+    features["has_rain"] = (features["precipitation_mm"] > 0.5).astype(int)
+    features["has_high_wind"] = (features["wind_speed_knots"] > 20).astype(int)
+    features["has_low_visibility"] = (features["visibility_m"] < 5000).astype(int)
+    features["wind_cloud_interaction"] = features["wind_speed_knots"] * features["cloud_cover_pct"] / 100
+    features["wind_precip_interaction"] = features["wind_speed_knots"] * features["precipitation_mm"]
+
     for col in FEATURE_COLUMNS:
         if col not in features.columns:
             features[col] = 0
@@ -145,15 +157,22 @@ def get_training_data(
     min_samples: int = 30,
     callsigns: Optional[List[str]] = None,
     db_path: Optional[Path] = None,
-) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     if callsigns:
         raw = get_filtered_feature_table(callsigns, db_path)
     else:
         raw = get_feature_table(db_path)
     min_samples = 5 if callsigns else 30
     if raw.empty or len(raw) < min_samples:
-        return pd.DataFrame(columns=FEATURE_COLUMNS), pd.Series(dtype=float), pd.Series(dtype=float)
+        return pd.DataFrame(columns=FEATURE_COLUMNS), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=str)
 
+    same_origin = raw["origin_airport"].fillna("") == raw["destination_airport"].fillna("")
+    raw = raw[~same_origin].copy()
+
+    if len(raw) < min_samples:
+        return pd.DataFrame(columns=FEATURE_COLUMNS), pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=str)
+
+    route_labels = _compute_route_labels(raw)
     features = build_features(raw)
 
     binary_target = raw[TARGET_BINARY].fillna(0).astype(int) if TARGET_BINARY in raw.columns else pd.Series(0, index=raw.index)
@@ -163,8 +182,9 @@ def get_training_data(
     features = features[valid_mask]
     binary_target = binary_target[valid_mask]
     reg_target = reg_target[valid_mask]
+    route_labels = route_labels[valid_mask]
 
-    return features, binary_target, reg_target
+    return features, binary_target, reg_target, route_labels
 
 
 def build_single_flight_features(
@@ -182,9 +202,11 @@ def build_single_flight_features(
     precipitation_mm: float = 0.0,
     temperature_c: float = 25.0,
     pressure_hpa: float = 1013.0,
-    route_avg_delay: float = 0.0,
-    route_delay_rate: float = 0.0,
 ) -> pd.DataFrame:
+    wind_knots = wind_speed_kmh * 0.539957
+    weather_sev = min(1.0, (wind_knots / 30) * 0.3 + (precipitation_mm / 10) * 0.3 + max(0, (10000 - visibility_m) / 10000) * 0.2 + (cloud_cover_pct / 100) * 0.2)
+    wind_sev = 0.0 if wind_knots <= 15 else (1.0 if wind_knots <= 25 else (2.0 if wind_knots <= 35 else (3.0 if wind_knots <= 45 else 4.0)))
+
     data = {
         "hour_of_day": hour_of_day,
         "day_of_week": day_of_week,
@@ -192,17 +214,22 @@ def build_single_flight_features(
         "is_weekend": int(day_of_week >= 5),
         "is_peak_hour": int(hour_of_day in _PEAK_HOURS),
         "route_encoded": hash(route) % 1000,
-        "route_historical_avg_delay": route_avg_delay,
-        "route_delay_rate": route_delay_rate,
         "airport_congestion": airport_congestion,
         "prev_flight_delay": prev_delay,
         "aircraft_daily_flights": aircraft_flights_today,
-        "wind_speed_knots": wind_speed_kmh * 0.539957,
+        "wind_speed_knots": wind_knots,
         "wind_gust_knots": wind_gusts_kmh * 0.539957,
         "visibility_m": visibility_m,
         "cloud_cover_pct": cloud_cover_pct,
         "precipitation_mm": precipitation_mm,
         "temperature_c": temperature_c,
         "pressure_hpa": pressure_hpa,
+        "weather_severity": weather_sev,
+        "wind_severity": wind_sev,
+        "has_rain": int(precipitation_mm > 0.5),
+        "has_high_wind": int(wind_knots > 20),
+        "has_low_visibility": int(visibility_m < 5000),
+        "wind_cloud_interaction": wind_knots * cloud_cover_pct / 100,
+        "wind_precip_interaction": wind_knots * precipitation_mm,
     }
     return pd.DataFrame([data], columns=FEATURE_COLUMNS)

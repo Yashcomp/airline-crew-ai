@@ -14,7 +14,23 @@ from data.models import Flight, Role
 from validators.dgca_validator import (
     check_crew_eligibility, full_compliance_check, compute_cost,
     MAX_DUTY_HOURS, MAX_ROLLING_7_DAY_HOURS, _limit,
+    GROUND_ROLES,
 )
+
+
+def _get_shift_for_hour(hour: int) -> str:
+    if 6 <= hour < 14:
+        return "Morning"
+    elif 14 <= hour < 22:
+        return "Evening"
+    else:
+        return "Night"
+
+
+def _is_shift_compatible(crew_shift: str, dep_hour: int) -> bool:
+    if not crew_shift:
+        return True
+    return crew_shift.lower() == _get_shift_for_hour(dep_hour).lower()
 
 
 def _update_crew_duty_hours(csv_path: str, crew_id: str, extra_hours: float) -> None:
@@ -426,8 +442,19 @@ def proactive_crew_assignment(
     db_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     from data.staff_manager import REQUIRED_CREW
+    from data.flights_db import get_all_assignments
 
     all_crew = load_crew(csv_path)
+
+    assignments = get_all_assignments(db_path) if db_path else []
+    crew_to_flight = {}
+    for a in assignments:
+        cid = a.get("crew_id", "").upper()
+        crew_to_flight[cid] = a.get("flight_id", "")
+
+    flight_risk = {}
+    for fl in today_schedule:
+        flight_risk[fl.get("callsign", "")] = fl.get("prediction", {}).get("risk_level", "Low")
 
     flights_needing_coverage = []
     standby_alerts = []
@@ -448,10 +475,29 @@ def proactive_crew_assignment(
 
         eligible_standby = []
         for member in all_crew:
+            assigned_flight = crew_to_flight.get(member.crew_id.upper(), "")
+
+            if assigned_flight == fid:
+                continue
+
+            if assigned_flight:
+                assigned_risk = flight_risk.get(assigned_flight, "Low")
+                if assigned_risk == "High":
+                    continue
+                elif assigned_risk == "Medium":
+                    tier = 2
+                else:
+                    tier = 1
+            else:
+                tier = 0
+
             if member.rest_status.lower() != "legal":
                 continue
             if member.current_duty_hours >= 11.5:
                 continue
+            if member.role in GROUND_ROLES and hasattr(member, 'shift') and member.shift:
+                if not _is_shift_compatible(member.shift, dep_hour):
+                    continue
             result = check_crew_eligibility(
                 member,
                 scenario_flight_hours=flight_hours,
@@ -467,9 +513,11 @@ def proactive_crew_assignment(
                     "rest_status": member.rest_status,
                     "current_duty_hours": member.current_duty_hours,
                     "rolling_7_day_hours": member.rolling_7_day_hours,
+                    "tier": tier,
+                    "assigned_flight": assigned_flight,
                 })
 
-        eligible_standby.sort(key=lambda x: x["cost"])
+        eligible_standby.sort(key=lambda x: (x["tier"], x["cost"]))
 
         suggestions = {}
         for role_name in REQUIRED_CREW:
@@ -483,18 +531,24 @@ def proactive_crew_assignment(
                     "rest_status": best["rest_status"],
                     "duty_hours": best["current_duty_hours"],
                     "rolling_7d": best["rolling_7_day_hours"],
+                    "tier": best["tier"],
+                    "assigned_flight": best["assigned_flight"],
                 }
 
         rec = {
             "flight_id": fid,
             "route": flight.get("route", ""),
             "scheduled_departure": flight.get("scheduled_departure", ""),
+            "scheduled_arrival": flight.get("scheduled_arrival", ""),
             "risk_level": risk,
             "delay_probability": pred.get("delay_probability", 0),
             "expected_delay_min": exp_delay,
             "factors": pred.get("factors", []),
             "suggested_crew": suggestions,
             "standby_count": len(eligible_standby),
+            "leg_type": flight.get("leg_type", "First Leg"),
+            "crew_action": flight.get("crew_action", ""),
+            "layover_turnaround_min": flight.get("layover_turnaround_min"),
         }
 
         crew_recommendations[fid] = rec

@@ -180,7 +180,11 @@ def forecast_crew_needs(
         "Captain": flights_today * captains_per_flight + extra_crew_needed,
         "FO": flights_today * fo_per_flight + extra_crew_needed,
         "CabinCrew": flights_today * cabin_per_flight + extra_crew_needed * 2,
-        "GroundStaff": flights_today * ground_per_flight + extra_crew_needed,
+        "RampAgent": flights_today * ground_per_flight + extra_crew_needed,
+        "BaggageHandler": flights_today * ground_per_flight + extra_crew_needed,
+        "CabinCleaner": flights_today * ground_per_flight + extra_crew_needed,
+        "CheckinAgent": flights_today * ground_per_flight + extra_crew_needed,
+        "SecurityAgent": flights_today * ground_per_flight + extra_crew_needed,
     }
 
     gaps = {}

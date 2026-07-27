@@ -68,7 +68,7 @@ class OpenSkyClient:
             time.sleep(self._min_interval - elapsed)
         self._last_request_time = time.time()
 
-    def _get(self, endpoint: str, params: Dict[str, Any]) -> Any:
+    def _get(self, endpoint: str, params: Dict[str, Any], _retry_count: int = 0) -> Any:
         self._rate_limit()
         url = f"{_BASE_URL}{endpoint}"
         resp = requests.get(url, params=params, headers=self.token_mgr.headers(), timeout=30)
@@ -84,14 +84,18 @@ class OpenSkyClient:
             return []
 
         if resp.status_code == 429:
+            if _retry_count >= 3:
+                return []
             retry_after = int(resp.headers.get("X-Rate-Limit-Retry-After-Seconds", 60))
-            time.sleep(retry_after)
-            return self._get(endpoint, params)
+            time.sleep(min(retry_after, 30))
+            return self._get(endpoint, params, _retry_count + 1)
 
         if resp.status_code == 401:
+            if _retry_count >= 3:
+                resp.raise_for_status()
             self.token_mgr._token = None
             self.token_mgr._expires_at = None
-            return self._get(endpoint, params)
+            return self._get(endpoint, params, _retry_count + 1)
 
         resp.raise_for_status()
         return resp.json()

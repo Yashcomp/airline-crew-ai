@@ -108,13 +108,18 @@ def _extract_night_duty(user_input: str) -> bool:
 
 
 def _extract_required_counts(user_input: str) -> Dict[str, int]:
-    required = {"Captain": 1, "FO": 1, "CabinCrew": 2, "GroundStaff": 1}
+    required = {"Captain": 1, "FO": 1, "CabinCrew": 2, "RampAgent": 1}
     lowered = user_input.lower()
     role_patterns = [
         (r"(\d+)\s*(?:captain|captains|cpt)\b", "Captain"),
         (r"(\d+)\s*(?:fo|first officer|first officers)\b", "FO"),
         (r"(\d+)\s*(?:cabin crew|cabincrew|flight attendant)\b", "CabinCrew"),
-        (r"(\d+)\s*(?:ground staff|groundstaff)\b", "GroundStaff"),
+        (r"(\d+)\s*(?:ramp agent|rampagent|ramp)\b", "RampAgent"),
+        (r"(\d+)\s*(?:baggage|baggage handler|baggagehandler)\b", "BaggageHandler"),
+        (r"(\d+)\s*(?:cabin cleaner|cabincleaner|cleaner)\b", "CabinCleaner"),
+        (r"(\d+)\s*(?:checkin|checkin agent|checkinagent)\b", "CheckinAgent"),
+        (r"(\d+)\s*(?:security|security agent|securityagent)\b", "SecurityAgent"),
+        (r"(\d+)\s*(?:ground staff|groundstaff)\b", "RampAgent"),
     ]
     for pattern, role in role_patterns:
         match = re.search(pattern, lowered)

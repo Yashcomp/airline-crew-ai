@@ -12,14 +12,27 @@ from data.flights_db import (
     is_crew_assigned, get_standby_crew, get_flight,
 )
 from data.models import CrewMember, Flight, Role
-from validators.dgca_validator import check_crew_eligibility
+from validators.dgca_validator import check_crew_eligibility, GROUND_ROLES
+
+
+def _get_shift_for_hour(hour: int) -> str:
+    if 6 <= hour < 14:
+        return "Morning"
+    elif 14 <= hour < 22:
+        return "Evening"
+    else:
+        return "Night"
 
 
 REQUIRED_CREW = {
     "Captain": 1,
     "FO": 1,
     "CabinCrew": 4,
-    "GroundStaff": 2,
+    "RampAgent": 1,
+    "BaggageHandler": 1,
+    "CabinCleaner": 1,
+    "CheckinAgent": 1,
+    "SecurityAgent": 1,
 }
 
 
@@ -64,10 +77,20 @@ def auto_assign_flight(
                 "Captain": Role.CAPTAIN,
                 "FO": Role.FO,
                 "CabinCrew": Role.CABIN_CREW,
-                "GroundStaff": Role.GROUND_STAFF,
+                "RampAgent": Role.RAMP_AGENT,
+                "BaggageHandler": Role.BAGGAGE_HANDLER,
+                "CabinCleaner": Role.CABIN_CLEANER,
+                "CheckinAgent": Role.CHECKIN_AGENT,
+                "SecurityAgent": Role.SECURITY_AGENT,
             }
             if member.role != role_map.get(role_name):
                 continue
+
+            if member.role in GROUND_ROLES and member.shift:
+                dep_hour = flight.std.hour if flight.std else 12
+                required_shift = _get_shift_for_hour(dep_hour)
+                if member.shift.lower() != required_shift.lower():
+                    continue
 
             result = assign_crew_to_flight(member.crew_id, flight_id, role_name, db_path)
             if result["status"] == "success":

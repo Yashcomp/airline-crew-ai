@@ -95,6 +95,43 @@ def get_historical_weather(
     return result
 
 
+def get_forecast_weather(
+    start_date: str,
+    end_date: str,
+    latitude: float = _BLR_LAT,
+    longitude: float = _BLR_LON,
+) -> List[Dict[str, Any]]:
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": _HOURLY_VARS,
+        "timezone": "Asia/Kolkata",
+    }
+    resp = requests.get(_OPEN_METEO_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    hourly = data.get("hourly", {})
+    times = hourly.get("time", [])
+    result = []
+    for i, t in enumerate(times):
+        result.append({
+            "timestamp": t,
+            "temperature_c": hourly.get("temperature_2m", [None])[i],
+            "wind_speed_kmh": hourly.get("wind_speed_10m", [None])[i],
+            "wind_direction_deg": hourly.get("wind_direction_10m", [None])[i],
+            "wind_gusts_kmh": hourly.get("wind_gusts_10m", [None])[i],
+            "visibility_m": hourly.get("visibility", [None])[i],
+            "cloud_cover_pct": hourly.get("cloud_cover", [None])[i],
+            "cloud_cover_low_pct": hourly.get("cloud_cover_low", [None])[i],
+            "precipitation_mm": hourly.get("precipitation", [None])[i],
+            "pressure_hpa": hourly.get("pressure_msl", [None])[i],
+            "weather_code": hourly.get("weather_code", [None])[i],
+        })
+    return result
+
+
 def get_current_weather(
     latitude: float = _BLR_LAT,
     longitude: float = _BLR_LON,
@@ -123,6 +160,19 @@ def get_weather_at_time(
             ts = row["timestamp"]
             if isinstance(ts, str) and f"T{hour:02d}" in ts:
                 return dict(row)
+    now = datetime.now(timezone.utc)
+    is_future = target_time.date() > now.date()
+    if is_future:
+        try:
+            forecast = get_forecast_weather(date_str, date_str, latitude, longitude)
+            if forecast:
+                _cache_weather(forecast)
+                hour = target_time.hour
+                for row in forecast:
+                    if f"T{hour:02d}" in row.get("timestamp", ""):
+                        return row
+        except Exception:
+            pass
     historical = get_historical_weather(date_str, date_str, latitude, longitude)
     if historical:
         _cache_weather(historical)

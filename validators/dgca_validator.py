@@ -14,40 +14,50 @@ from data.models import CrewMember, Flight, Role
 # ---------------------------------------------------------------------------
 # Per-role limits (DGCA CAR Section 7 Series J Part III)
 # ---------------------------------------------------------------------------
+GROUND_ROLES = [
+    Role.GROUND_STAFF, Role.RAMP_AGENT, Role.BAGGAGE_HANDLER,
+    Role.CABIN_CLEANER, Role.CHECKIN_AGENT, Role.SECURITY_AGENT,
+]
+
 MAX_DUTY_HOURS: Dict[Role, float] = {
     Role.CAPTAIN: 12.0,
     Role.FO: 12.0,
     Role.CABIN_CREW: 14.0,
-    Role.GROUND_STAFF: 10.0,
 }
+for _r in GROUND_ROLES:
+    MAX_DUTY_HOURS[_r] = 10.0
 
 MAX_ROLLING_7_DAY_HOURS: Dict[Role, float] = {
     Role.CAPTAIN: 35.0,
     Role.FO: 35.0,
     Role.CABIN_CREW: 45.0,
-    Role.GROUND_STAFF: inf,
 }
+for _r in GROUND_ROLES:
+    MAX_ROLLING_7_DAY_HOURS[_r] = inf
 
 MAX_CONSECUTIVE_NIGHT_SHIFTS: Dict[Role, int] = {
     Role.CAPTAIN: 2,
     Role.FO: 2,
     Role.CABIN_CREW: 3,
-    Role.GROUND_STAFF: 999,
 }
+for _r in GROUND_ROLES:
+    MAX_CONSECUTIVE_NIGHT_SHIFTS[_r] = 999
 
 MAX_CONSECUTIVE_DAYS_ON: Dict[Role, int] = {
     Role.CAPTAIN: 6,
     Role.FO: 6,
     Role.CABIN_CREW: 6,
-    Role.GROUND_STAFF: 6,
 }
+for _r in GROUND_ROLES:
+    MAX_CONSECUTIVE_DAYS_ON[_r] = 6
 
 STANDARD_DUTY_THRESHOLD: Dict[Role, float] = {
     Role.CAPTAIN: 10.0,
     Role.FO: 10.0,
     Role.CABIN_CREW: 10.0,
-    Role.GROUND_STAFF: 8.0,
 }
+for _r in GROUND_ROLES:
+    STANDARD_DUTY_THRESHOLD[_r] = 8.0
 
 MIN_REST_HOURS: float = 10.0
 MIN_LAYOVER_MINUTES: int = 600
@@ -61,29 +71,33 @@ MAX_14_DAY_HOURS: Dict[Role, float] = {
     Role.CAPTAIN: 60.0,
     Role.FO: 60.0,
     Role.CABIN_CREW: 80.0,
-    Role.GROUND_STAFF: inf,
 }
+for _r in GROUND_ROLES:
+    MAX_14_DAY_HOURS[_r] = inf
 
 MAX_28_DAY_HOURS: Dict[Role, float] = {
     Role.CAPTAIN: 100.0,
     Role.FO: 100.0,
     Role.CABIN_CREW: 130.0,
-    Role.GROUND_STAFF: inf,
 }
+for _r in GROUND_ROLES:
+    MAX_28_DAY_HOURS[_r] = inf
 
 MAX_90_DAY_HOURS: Dict[Role, float] = {
     Role.CAPTAIN: 270.0,
     Role.FO: 270.0,
     Role.CABIN_CREW: 350.0,
-    Role.GROUND_STAFF: inf,
 }
+for _r in GROUND_ROLES:
+    MAX_90_DAY_HOURS[_r] = inf
 
 MAX_365_DAY_HOURS: Dict[Role, float] = {
     Role.CAPTAIN: 1000.0,
     Role.FO: 1000.0,
     Role.CABIN_CREW: 1300.0,
-    Role.GROUND_STAFF: inf,
 }
+for _r in GROUND_ROLES:
+    MAX_365_DAY_HOURS[_r] = inf
 
 # Weekly rest requirements
 MIN_WEEKLY_REST_HOURS = 48.0
@@ -197,7 +211,7 @@ def check_crew_eligibility(
 
     if flights:
         for flight in flights:
-            if member.role != Role.GROUND_STAFF and not member.is_rated_on(flight.aircraft_type):
+            if member.role not in GROUND_ROLES and not member.is_rated_on(flight.aircraft_type):
                 violations.append(
                     f"Not type-rated for {flight.aircraft_type} (flight {flight.flight_id})"
                 )
@@ -323,6 +337,9 @@ def check_ulr_compliance(member: CrewMember, flights: List[Flight]) -> Complianc
 def check_wocl(member: CrewMember, flights: List[Flight]) -> ComplianceResult:
     violations: List[str] = []
     warnings: List[str] = []
+
+    if member.role in GROUND_ROLES:
+        return ComplianceResult(eligible=True, violations=[], warnings=[])
 
     for flight in flights:
         wocl_issue = _check_wocl_violation(member, flight)
@@ -450,7 +467,7 @@ def _build_rules_context() -> str:
         "- Captain: 12 hours\n"
         "- First Officer (FO): 12 hours\n"
         "- Cabin Crew: 14 hours\n"
-        "- Ground Staff: 10 hours\n\n"
+        "- Ground Staff (all roles): 10 hours\n\n"
         "ROLLING 7-DAY HOUR LIMITS:\n"
         "- Captain: 35 hours\n"
         "- First Officer (FO): 35 hours\n"

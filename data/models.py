@@ -11,6 +11,11 @@ class Role(str, Enum):
     FO = "FO"
     CABIN_CREW = "CabinCrew"
     GROUND_STAFF = "GroundStaff"
+    RAMP_AGENT = "RampAgent"
+    BAGGAGE_HANDLER = "BaggageHandler"
+    CABIN_CLEANER = "CabinCleaner"
+    CHECKIN_AGENT = "CheckinAgent"
+    SECURITY_AGENT = "SecurityAgent"
     SECURITY = "Security"
     GROUND_HANDLING = "GroundHandling"
     MAINTENANCE = "Maintenance"
@@ -73,6 +78,7 @@ class CrewMember:
     hours_flown_30_days: float = 0.0
     days_since_rest: int = 0
     consecutive_days_on: int = 0
+    shift: str = ""
 
     @property
     def rated_aircraft(self) -> List[str]:
@@ -102,6 +108,7 @@ class CrewMember:
             "hours_flown_30_days": self.hours_flown_30_days,
             "days_since_rest": self.days_since_rest,
             "consecutive_days_on": self.consecutive_days_on,
+            "shift": self.shift,
         }
 
 

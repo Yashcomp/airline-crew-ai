@@ -24,6 +24,70 @@ _MODEL_METADATA_PATH = _MODELS_DIR / "model_metadata.pkl"
 
 _DELAY_THRESHOLD_MIN = 15.0
 
+_WEATHER_BASELINE = {
+    "wind_kmh": 21.0,
+    "precip_mm": 0.1,
+    "vis_m": 10000.0,
+    "cloud_pct": 88.5,
+}
+
+
+def _compute_weather_adjustment(
+    wind_speed_kmh: float, wind_gusts_kmh: float,
+    visibility_m: float, precipitation_mm: float,
+    cloud_cover_pct: float, departure_hour: int,
+) -> Dict[str, float]:
+    prob_boost = 0.0
+    delay_boost = 0.0
+
+    wind_ratio = max(0, (wind_speed_kmh - _WEATHER_BASELINE["wind_kmh"]) / _WEATHER_BASELINE["wind_kmh"])
+    if wind_speed_kmh > 35:
+        prob_boost += min(0.25, wind_ratio * 0.3)
+        delay_boost += min(15, wind_ratio * 20)
+    elif wind_speed_kmh > 25:
+        prob_boost += min(0.10, wind_ratio * 0.15)
+        delay_boost += min(5, wind_ratio * 8)
+
+    gust_ratio = max(0, (wind_gusts_kmh - 50) / 50)
+    if wind_gusts_kmh > 50:
+        prob_boost += min(0.15, gust_ratio * 0.2)
+        delay_boost += min(10, gust_ratio * 15)
+
+    if precipitation_mm > 0.5:
+        precip_severity = min(1.0, precipitation_mm / 10)
+        prob_boost += precip_severity * 0.20
+        delay_boost += precip_severity * 12
+    if precipitation_mm > 5:
+        prob_boost += 0.05
+        delay_boost += 5
+
+    if visibility_m < 5000:
+        vis_severity = max(0, (5000 - visibility_m) / 5000)
+        prob_boost += vis_severity * 0.15
+        delay_boost += vis_severity * 10
+    if visibility_m < 1000:
+        prob_boost += 0.10
+        delay_boost += 8
+
+    if cloud_cover_pct > 95:
+        prob_boost += 0.03
+        delay_boost += 2
+    elif cloud_cover_pct > 80:
+        prob_boost += 0.01
+
+    if departure_hour in (8, 9, 17, 18, 19, 20):
+        prob_boost += 0.03
+        delay_boost += 2
+
+    if wind_speed_kmh > 40 and precipitation_mm > 5 and visibility_m < 2000:
+        prob_boost += 0.10
+        delay_boost += 8
+
+    return {
+        "probability_boost": round(prob_boost, 3),
+        "delay_boost": round(delay_boost, 1),
+    }
+
 
 def _ensure_models_dir() -> None:
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,6 +120,15 @@ def _load_metadata() -> Dict[str, Any]:
     return {}
 
 
+def _compute_class_weights(y: pd.Series) -> Dict[int, float]:
+    counts = y.value_counts()
+    total = len(y)
+    weights = {}
+    for cls in counts.index:
+        weights[int(cls)] = total / (len(counts) * counts[cls])
+    return weights
+
+
 def train_model(
     min_samples: int = 30,
     callsigns: Optional[List[str]] = None,
@@ -63,7 +136,7 @@ def train_model(
 ) -> Dict[str, Any]:
     if callsigns:
         min_samples = min(min_samples, 5)
-    features, binary_target, reg_target = get_training_data(
+    features, binary_target, reg_target, route_labels = get_training_data(
         min_samples=min_samples, callsigns=callsigns, db_path=db_path,
     )
 
@@ -75,49 +148,186 @@ def train_model(
             "message": f"Need {min_samples} samples, have {len(features)}. Using heuristic fallback.",
         }
 
-    clf = XGBClassifier(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
-        eval_metric="logloss",
-        random_state=42,
+    from sklearn.model_selection import GroupKFold, train_test_split
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score, f1_score,
+        mean_absolute_error, mean_squared_error, r2_score,
+        confusion_matrix, roc_auc_score, log_loss,
+        average_precision_score, matthews_corrcoef,
+        cohen_kappa_score, balanced_accuracy_score,
     )
-    clf.fit(features, binary_target)
 
-    reg = XGBRegressor(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
-        random_state=42,
+    class_weights = _compute_class_weights(binary_target)
+    sample_weights = binary_target.map(class_weights).values
+
+    n_splits = min(5, route_labels.nunique())
+    gkf = GroupKFold(n_splits=n_splits)
+
+    clf_metrics_list = []
+    reg_metrics_list = []
+
+    for train_idx, test_idx in gkf.split(features, binary_target, groups=route_labels):
+        X_tr, X_te = features.iloc[train_idx], features.iloc[test_idx]
+        y_tr_clf, y_te_clf = binary_target.iloc[train_idx], binary_target.iloc[test_idx]
+        y_tr_reg, y_te_reg = reg_target.iloc[train_idx], reg_target.iloc[test_idx]
+        sw_tr = sample_weights[train_idx]
+
+        pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0)
+
+        clf = XGBClassifier(
+            n_estimators=150, max_depth=6, learning_rate=0.1,
+            eval_metric="logloss", random_state=42,
+            reg_alpha=0.1, reg_lambda=1.0,
+            scale_pos_weight=pos_weight,
+            min_child_weight=2,
+            subsample=0.9, colsample_bytree=0.9,
+        )
+        clf.fit(X_tr, y_tr_clf, sample_weight=sw_tr)
+
+        reg = XGBRegressor(
+            n_estimators=150, max_depth=6, learning_rate=0.1,
+            random_state=42, reg_alpha=0.1, reg_lambda=1.0,
+            min_child_weight=2,
+            subsample=0.9, colsample_bytree=0.9,
+        )
+        reg.fit(X_tr, y_tr_reg)
+
+        y_te_pred = clf.predict(X_te)
+        y_te_proba = clf.predict_proba(X_te)[:, 1] if hasattr(clf, "predict_proba") else y_te_pred.astype(float)
+        y_te_reg_pred = reg.predict(X_te)
+
+        n_delayed_te = int(y_te_clf.sum())
+        clf_m = {
+            "accuracy": accuracy_score(y_te_clf, y_te_pred),
+            "balanced_accuracy": balanced_accuracy_score(y_te_clf, y_te_pred),
+            "precision": precision_score(y_te_clf, y_te_pred, zero_division=0),
+            "recall": recall_score(y_te_clf, y_te_pred, zero_division=0),
+            "f1": f1_score(y_te_clf, y_te_pred, zero_division=0),
+            "mcc": matthews_corrcoef(y_te_clf, y_te_pred),
+            "kappa": cohen_kappa_score(y_te_clf, y_te_pred),
+            "roc_auc": roc_auc_score(y_te_clf, y_te_proba) if n_delayed_te > 0 else None,
+            "pr_auc": average_precision_score(y_te_clf, y_te_proba) if n_delayed_te > 0 else None,
+            "log_loss": log_loss(y_te_clf, y_te_proba),
+            "confusion": confusion_matrix(y_te_clf, y_te_pred).tolist(),
+            "samples": len(y_te_clf),
+            "delayed_in_test": n_delayed_te,
+        }
+        clf_metrics_list.append(clf_m)
+
+        reg_m = {
+            "mae": mean_absolute_error(y_te_reg, y_te_reg_pred),
+            "rmse": float(np.sqrt(mean_squared_error(y_te_reg, y_te_reg_pred))),
+            "r2": r2_score(y_te_reg, y_te_reg_pred),
+        }
+        reg_metrics_list.append(reg_m)
+
+    def _avg_dicts(dicts, keys=None):
+        if not dicts:
+            return {}
+        if keys is None:
+            keys = [k for k in dicts[0] if isinstance(dicts[0][k], (int, float)) and dicts[0][k] is not None]
+        result = {}
+        for k in keys:
+            vals = [d[k] for d in dicts if k in d and d[k] is not None]
+            result[k] = round(np.mean(vals), 4) if vals else None
+        return result
+
+    avg_clf = _avg_dicts(clf_metrics_list)
+    avg_reg = _avg_dicts(reg_metrics_list)
+
+    fold_clf_accs = [d["accuracy"] for d in clf_metrics_list]
+    fold_clf_f1s = [d["f1"] for d in clf_metrics_list]
+    fold_clf_aucs = [d["roc_auc"] for d in clf_metrics_list if d["roc_auc"] is not None]
+
+    train_idx_final, test_idx_final = next(gkf.split(features, binary_target, groups=route_labels))
+    X_train_final = features.iloc[train_idx_final]
+    X_test_final = features.iloc[test_idx_final]
+    y_train_final = binary_target.iloc[train_idx_final]
+    y_test_final = binary_target.iloc[test_idx_final]
+    y_reg_train_final = reg_target.iloc[train_idx_final]
+    y_reg_test_final = reg_target.iloc[test_idx_final]
+    sw_train_final = sample_weights[train_idx_final]
+
+    pos_weight_final = class_weights.get(1, 1.0) / class_weights.get(0, 1.0)
+
+    clf_final = XGBClassifier(
+        n_estimators=150, max_depth=6, learning_rate=0.1,
+        eval_metric="logloss", random_state=42,
+        reg_alpha=0.1, reg_lambda=1.0,
+        scale_pos_weight=pos_weight_final,
+        min_child_weight=2,
+        subsample=0.9, colsample_bytree=0.9,
     )
-    reg.fit(features, reg_target)
+    clf_final.fit(X_train_final, y_train_final, sample_weight=sw_train_final)
 
-    from sklearn.metrics import accuracy_score, mean_absolute_error
-    clf_pred = clf.predict(features)
-    clf_accuracy = accuracy_score(binary_target, clf_pred)
-    reg_pred = reg.predict(features)
-    reg_mae = mean_absolute_error(reg_target, reg_pred)
+    reg_final = XGBRegressor(
+        n_estimators=150, max_depth=6, learning_rate=0.1,
+        random_state=42, reg_alpha=0.1, reg_lambda=1.0,
+        min_child_weight=2,
+        subsample=0.9, colsample_bytree=0.9,
+    )
+    reg_final.fit(X_train_final, y_reg_train_final)
 
-    feature_importance = dict(zip(FEATURE_COLUMNS, clf.feature_importances_.tolist()))
+    feature_importance = dict(zip(FEATURE_COLUMNS, clf_final.feature_importances_.tolist()))
 
     metadata = {
         "trained_at": datetime.now().isoformat(),
         "samples": len(features),
-        "classifier_accuracy": round(clf_accuracy, 4),
-        "regressor_mae": round(reg_mae, 2),
+        "train_samples": len(X_train_final),
+        "test_samples": len(X_test_final),
+        "class_weights": {str(k): round(v, 4) for k, v in class_weights.items()},
+        "delay_rate": round(float(binary_target.mean()), 4),
+        "n_routes": int(route_labels.nunique()),
+        "n_folds": n_splits,
+        "classifier_cv": {k: round(v, 4) if isinstance(v, float) else v for k, v in avg_clf.items() if k != "confusion"},
+        "classifier_test": {k: round(v, 4) if isinstance(v, float) else v for k, v in avg_clf.items() if k != "confusion"},
+        "regressor_cv": {k: round(v, 4) for k, v in avg_reg.items()},
+        "fold_accuracy": [round(a, 4) for a in fold_clf_accs],
+        "fold_f1": [round(f, 4) for f in fold_clf_f1s],
+        "fold_roc_auc": [round(a, 4) for a in fold_clf_aucs],
         "feature_importance": {k: round(v, 4) for k, v in sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)},
         "feature_columns": FEATURE_COLUMNS,
     }
 
-    _save_models(clf, reg, metadata)
+    _save_models(clf_final, reg_final, metadata)
 
+    cv_acc = avg_clf.get("accuracy", 0)
+    cv_f1 = avg_clf.get("f1", 0)
+    cv_auc = avg_clf.get("roc_auc")
+    cv_mcc = avg_clf.get("mcc", 0)
+    cv_mae = avg_reg.get("mae", 0)
+
+    auc_str = f"{cv_auc:.4f}" if cv_auc is not None else "N/A"
     return {
         "status": "success",
         "samples": len(features),
-        "classifier_accuracy": round(clf_accuracy, 4),
-        "regressor_mae": round(reg_mae, 2),
+        "train_samples": len(X_train_final),
+        "test_samples": len(X_test_final),
+        "n_routes": int(route_labels.nunique()),
+        "delay_rate": round(float(binary_target.mean()), 4),
+        "class_weights": {str(k): round(v, 4) for k, v in class_weights.items()},
+        "cv_accuracy": round(cv_acc, 4),
+        "cv_balanced_accuracy": round(avg_clf.get("balanced_accuracy", 0), 4),
+        "cv_precision": round(avg_clf.get("precision", 0), 4),
+        "cv_recall": round(avg_clf.get("recall", 0), 4),
+        "cv_f1": round(cv_f1, 4),
+        "cv_mcc": round(cv_mcc, 4),
+        "cv_kappa": round(avg_clf.get("kappa", 0), 4),
+        "cv_roc_auc": round(cv_auc, 4) if cv_auc is not None else None,
+        "cv_pr_auc": round(avg_clf.get("pr_auc", 0), 4) if avg_clf.get("pr_auc") is not None else None,
+        "cv_log_loss": round(avg_clf.get("log_loss", 0), 4),
+        "fold_accuracy": [round(a, 4) for a in fold_clf_accs],
+        "fold_f1": [round(f, 4) for f in fold_clf_f1s],
+        "fold_roc_auc": [round(a, 4) for a in fold_clf_aucs],
+        "cv_mae": round(cv_mae, 2),
+        "cv_rmse": round(avg_reg.get("rmse", 0), 2),
+        "cv_r2": round(avg_reg.get("r2", 0), 4),
         "feature_importance": metadata["feature_importance"],
-        "message": f"Trained on {len(features)} samples. Accuracy: {clf_accuracy:.1%}, MAE: {reg_mae:.1f} min",
+        "message": (
+            f"Trained on {len(features)} samples ({n_splits}-fold GroupKFold by route). "
+            f"CV Accuracy: {cv_acc:.1%}, F1: {cv_f1:.4f}, MCC: {cv_mcc:.4f}, "
+            f"ROC-AUC: {auc_str}, Regression MAE: {cv_mae:.1f}min"
+        ),
     }
 
 
@@ -225,6 +435,8 @@ def predict_delay(
     temperature_c: float = 25.0,
     pressure_hpa: float = 1013.0,
     delay_rate_pct: Optional[float] = None,
+    dow_delay_rate: Optional[float] = None,
+    overall_delay_rate: Optional[float] = None,
 ) -> Dict[str, Any]:
     if departure_time is None:
         departure_time = datetime.now()
@@ -236,32 +448,6 @@ def predict_delay(
     precipitation_mm = float(precipitation_mm or 0)
     temperature_c = float(temperature_c or 25)
     pressure_hpa = float(pressure_hpa or 1013)
-
-    route_avg_delay = 0.0
-    route_delay_rate = 0.0
-    try:
-        _db = sqlite3.connect(str(Path(__file__).parent.parent / "data" / "flights.db"))
-        _cur = _db.execute(
-            "SELECT AVG(deviation_min) FROM delay_labels WHERE origin=? AND destination=?",
-            (origin, destination),
-        )
-        _row = _cur.fetchone()
-        if _row and _row[0] is not None:
-            route_avg_delay = float(_row[0])
-
-        if delay_rate_pct is not None:
-            route_delay_rate = float(delay_rate_pct) / 100.0
-        else:
-            _cur2 = _db.execute(
-                "SELECT AVG(CAST(is_delayed AS REAL)) FROM delay_labels WHERE origin=? AND destination=?",
-                (origin, destination),
-            )
-            _row2 = _cur2.fetchone()
-            if _row2 and _row2[0] is not None:
-                route_delay_rate = float(_row2[0])
-        _db.close()
-    except Exception:
-        pass
 
     features_df = build_single_flight_features(
         hour_of_day=departure_hour,
@@ -276,8 +462,6 @@ def predict_delay(
         precipitation_mm=precipitation_mm,
         temperature_c=temperature_c,
         pressure_hpa=pressure_hpa,
-        route_avg_delay=route_avg_delay,
-        route_delay_rate=route_delay_rate,
     )
 
     ml_result = _predict_with_ml(features_df)
@@ -289,13 +473,33 @@ def predict_delay(
             pax_count, flight_duration_min, is_international,
         )
 
+    weather_adj = _compute_weather_adjustment(
+        wind_speed_kmh=wind_speed_kmh, wind_gusts_kmh=wind_gusts_kmh,
+        visibility_m=visibility_m, precipitation_mm=precipitation_mm,
+        cloud_cover_pct=cloud_cover_pct, departure_hour=departure_hour,
+    )
+    base_prob = result["delay_probability"]
+    adjusted_prob = max(0.05, min(0.95, base_prob + weather_adj["probability_boost"]))
+    result["delay_probability"] = round(adjusted_prob, 3)
+    result["expected_delay_min"] = round(result["expected_delay_min"] + weather_adj["delay_boost"], 1)
+
+    _GLOBAL_BASELINE_DELAY_RATE = 0.02
+    if dow_delay_rate is not None and overall_delay_rate is not None and overall_delay_rate > 0 and dow_delay_rate > 0:
+        base_prob = result["delay_probability"]
+        scale_factor = dow_delay_rate / max(overall_delay_rate, _GLOBAL_BASELINE_DELAY_RATE)
+        scale_factor = max(0.3, min(3.0, scale_factor))
+        adjusted_prob = base_prob * scale_factor
+        adjusted_prob = max(0.05, min(0.95, adjusted_prob))
+        result["delay_probability"] = round(adjusted_prob, 3)
+        result["expected_delay_min"] = round(result["expected_delay_min"] * scale_factor, 1)
+
     prob = result["delay_probability"]
     exp_delay = result["expected_delay_min"]
     risk_score = prob * exp_delay
     risk_level = "Low"
-    if risk_score > 25:
+    if prob > 0.15 or (prob > 0.10 and exp_delay > 5):
         risk_level = "High"
-    elif risk_score > 10:
+    elif prob > 0.06 or (prob > 0.05 and exp_delay > 3):
         risk_level = "Medium"
 
     factors = []
@@ -323,6 +527,27 @@ def predict_delay(
         factors.append("Prediction based on trained ML model")
     else:
         factors.append("Prediction based on heuristic (model not yet trained)")
+
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    if dow_delay_rate is not None and overall_delay_rate is not None and overall_delay_rate > 0:
+        dow_pct = dow_delay_rate * 100
+        overall_pct = overall_delay_rate * 100
+        if departure_time is not None:
+            day_name = day_names[departure_time.weekday()]
+        else:
+            day_name = "this day"
+        if dow_pct > overall_pct * 1.2:
+            factors.append(
+                f"Historically {dow_pct:.0f}% delay rate on {day_name} vs {overall_pct:.0f}% overall"
+            )
+        elif dow_pct < overall_pct * 0.8 and dow_pct > 0:
+            factors.append(
+                f"Lower historical delay rate on {day_name} ({dow_pct:.0f}% vs {overall_pct:.0f}% overall)"
+            )
+        elif dow_pct == 0 and overall_pct > 5:
+            factors.append(
+                f"No historical delays on {day_name} for this route (vs {overall_pct:.0f}% overall)"
+            )
 
     result.update({
         "risk_level": risk_level,
@@ -415,6 +640,7 @@ def get_delay_insights(db_path: Optional[Path] = None) -> Dict[str, Any]:
             by_route[f"{o}-{d}"] = int(c)
 
     model_meta = _load_metadata()
+    cv = model_meta.get("classifier_cv", {})
 
     return {
         "total_flights": total,
@@ -424,8 +650,11 @@ def get_delay_insights(db_path: Optional[Path] = None) -> Dict[str, Any]:
         "delay_by_route": by_route,
         "model_status": {
             "trained": model_meta.get("trained_at") is not None,
-            "accuracy": model_meta.get("classifier_accuracy"),
-            "mae": model_meta.get("regressor_mae"),
+            "cv_accuracy": cv.get("accuracy"),
+            "cv_f1": cv.get("f1"),
+            "cv_mcc": cv.get("mcc"),
+            "cv_roc_auc": cv.get("roc_auc"),
+            "cv_mae": model_meta.get("regressor_cv", {}).get("mae"),
         },
     }
 

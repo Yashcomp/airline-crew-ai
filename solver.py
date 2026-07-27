@@ -28,7 +28,11 @@ DEFAULT_REQUIRED_COUNTS = {
     Role.CAPTAIN.value: 1,
     Role.FO.value: 1,
     Role.CABIN_CREW.value: 2,
-    Role.GROUND_STAFF.value: 1,
+    Role.RAMP_AGENT.value: 1,
+    Role.BAGGAGE_HANDLER.value: 1,
+    Role.CABIN_CLEANER.value: 1,
+    Role.CHECKIN_AGENT.value: 1,
+    Role.SECURITY_AGENT.value: 1,
 }
 
 
@@ -249,7 +253,11 @@ def main() -> None:
     parser.add_argument("--captains", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.CAPTAIN.value])
     parser.add_argument("--fos", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.FO.value])
     parser.add_argument("--cabin-crew", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.CABIN_CREW.value])
-    parser.add_argument("--ground-staff", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.GROUND_STAFF.value])
+    parser.add_argument("--ramp-agents", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.RAMP_AGENT.value])
+    parser.add_argument("--baggage-handlers", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.BAGGAGE_HANDLER.value])
+    parser.add_argument("--cabin-cleaners", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.CABIN_CLEANER.value])
+    parser.add_argument("--checkin-agents", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.CHECKIN_AGENT.value])
+    parser.add_argument("--security-agents", type=int, default=DEFAULT_REQUIRED_COUNTS[Role.SECURITY_AGENT.value])
     parser.add_argument("--multi-flight", nargs="+", help="Flight IDs for multi-flight assignment")
     args = parser.parse_args()
 
@@ -257,7 +265,11 @@ def main() -> None:
         Role.CAPTAIN.value: args.captains,
         Role.FO.value: args.fos,
         Role.CABIN_CREW.value: args.cabin_crew,
-        Role.GROUND_STAFF.value: args.ground_staff,
+        Role.RAMP_AGENT.value: args.ramp_agents,
+        Role.BAGGAGE_HANDLER.value: args.baggage_handlers,
+        Role.CABIN_CLEANER.value: args.cabin_cleaners,
+        Role.CHECKIN_AGENT.value: args.checkin_agents,
+        Role.SECURITY_AGENT.value: args.security_agents,
     }
 
     if args.multi_flight:

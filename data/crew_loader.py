@@ -19,6 +19,17 @@ ROLE_ALIASES = {
     "FLIGHT ATTENDANT": Role.CABIN_CREW,
     "GROUND STAFF": Role.GROUND_STAFF,
     "GROUNDSTAFF": Role.GROUND_STAFF,
+    "RAMP AGENT": Role.RAMP_AGENT,
+    "RAMPAGENT": Role.RAMP_AGENT,
+    "BAGGAGE HANDLER": Role.BAGGAGE_HANDLER,
+    "BAGGAGEHANDLER": Role.BAGGAGE_HANDLER,
+    "CABIN CLEANER": Role.CABIN_CLEANER,
+    "CABINCLEANER": Role.CABIN_CLEANER,
+    "CHECKIN AGENT": Role.CHECKIN_AGENT,
+    "CHECKINAGENT": Role.CHECKIN_AGENT,
+    "CHECK-IN AGENT": Role.CHECKIN_AGENT,
+    "SECURITY AGENT": Role.SECURITY_AGENT,
+    "SECURITYAGENT": Role.SECURITY_AGENT,
 }
 
 
@@ -108,6 +119,7 @@ def load_crew(csv_path: str | Path) -> List[CrewMember]:
                     consecutive_days_on=_parse_int(
                         row.get("consecutive_days_on", row.get("Consecutive_Days_On", 0))
                     ),
+                    shift=str(row.get("shift", row.get("Shift", ""))).strip(),
                 )
             else:
                 member = CrewMember(
@@ -120,6 +132,7 @@ def load_crew(csv_path: str | Path) -> List[CrewMember]:
                     rest_status=str(row.get("Rest_Status", "Legal")).strip().capitalize(),
                     base_cost=_parse_float(row.get("Base_Cost", 1.0), 1.0),
                     overtime_multiplier=_parse_float(row.get("Overtime_Multiplier", 1.0), 1.0),
+                    shift=str(row.get("shift", row.get("Shift", ""))).strip(),
                 )
 
             if member.crew_id and member.name:

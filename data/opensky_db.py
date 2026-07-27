@@ -287,7 +287,7 @@ def compute_rotation_chains(db_path: Optional[Path] = None) -> int:
 
 
 def compute_delay_labels(
-    delay_threshold_min: float = 15.0,
+    delay_threshold_pct: float = 0.20,
     db_path: Optional[Path] = None,
 ) -> int:
     path = db_path or DEFAULT_DB_PATH
@@ -299,15 +299,30 @@ def compute_delay_labels(
            FROM opensky_flights
            WHERE duration_min IS NOT NULL AND first_seen IS NOT NULL"""
     ).fetchall()
-    route_stats: Dict[str, List[float]] = {}
+
+    route_hours: Dict[str, Dict[int, List[float]]] = {}
     for r in rows:
         origin = r["origin_airport"]
         dest = r["destination_airport"]
         if not origin or not dest:
             continue
         key = f"{origin}_{dest}"
-        route_stats.setdefault(key, []).append(r["duration_min"])
-    route_avgs = {k: sum(v) / len(v) for k, v in route_stats.items() if v}
+        dt = datetime.fromtimestamp(r["first_seen"], tz=timezone.utc)
+        hour_bucket = dt.hour // 3 * 3
+        route_hours.setdefault(key, {}).setdefault(hour_bucket, []).append(r["duration_min"])
+
+    route_expected: Dict[str, Dict[int, float]] = {}
+    for key, hours in route_hours.items():
+        route_expected[key] = {}
+        for hour_bucket, durations in hours.items():
+            route_expected[key][hour_bucket] = sum(durations) / len(durations)
+
+    route_avgs: Dict[str, float] = {}
+    for key, hours in route_hours.items():
+        all_durations = [d for bucket_durs in hours.values() for d in bucket_durs]
+        if all_durations:
+            route_avgs[key] = sum(all_durations) / len(all_durations)
+
     count = 0
     for r in rows:
         origin = r["origin_airport"]
@@ -315,14 +330,23 @@ def compute_delay_labels(
         if not origin or not dest:
             continue
         key = f"{origin}_{dest}"
-        expected = route_avgs.get(key)
+        dt = datetime.fromtimestamp(r["first_seen"], tz=timezone.utc)
+        hour_bucket = dt.hour // 3 * 3
+
+        expected = None
+        if key in route_expected and hour_bucket in route_expected[key]:
+            expected = route_expected[key][hour_bucket]
+        if expected is None:
+            expected = route_avgs.get(key)
         if expected is None:
             expected = r["duration_min"]
         if expected is None:
             continue
+
         deviation = (r["duration_min"] or 0) - expected
-        is_delayed = 1 if deviation > delay_threshold_min else 0
-        dt = datetime.fromtimestamp(r["first_seen"], tz=timezone.utc)
+        threshold = max(expected * delay_threshold_pct, 10.0)
+        is_delayed = 1 if deviation > threshold else 0
+
         flight_id = r["flight_id"] if r["flight_id"] else f"{r['icao24']}_{r['first_seen']}"
         try:
             conn.execute(
@@ -356,10 +380,29 @@ def seed_historical_data(
     total_flights = 0
     total_weather = 0
     errors = []
+
+    conn = _connect(path)
+    try:
+        existing_dates = set(
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT date FROM opensky_flights WHERE date IS NOT NULL"
+            ).fetchall()
+        )
+    except Exception:
+        existing_dates = set()
+    finally:
+        conn.close()
+
+    days_skipped = 0
     for d in range(days, 0, -1):
         date = now - timedelta(days=d)
-        begin, end = utc_day_range(date)
         date_str = date.strftime("%Y-%m-%d")
+
+        if date_str in existing_dates:
+            days_skipped += 1
+            continue
+
+        begin, end = utc_day_range(date)
         try:
             departures = client.get_departures("VOBL", begin, end)
             arrivals = client.get_arrivals("VOBL", begin, end)
@@ -370,11 +413,15 @@ def seed_historical_data(
             total_weather += weather_records
         except Exception as e:
             errors.append(f"{date_str}: {e}")
-    compute_rotation_chains(db_path)
-    compute_delay_labels(db_path=db_path)
+
+    if total_flights > 0:
+        compute_rotation_chains(db_path)
+        compute_delay_labels(db_path=db_path)
+
     return {
         "status": "success",
         "days_seeded": days,
+        "days_skipped": days_skipped,
         "total_flights": total_flights,
         "total_weather_records": total_weather,
         "errors": errors,
@@ -662,49 +709,139 @@ def get_flight_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
     }
 
 
+def get_route_dayofweek_stats(
+    db_path: Optional[Path] = None,
+) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return {}
+    conn = _connect(path)
+    try:
+        rows = conn.execute("""
+            SELECT origin, destination, day_of_week,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN is_delayed = 1 THEN 1 ELSE 0 END) as delayed,
+                   ROUND(AVG(ABS(COALESCE(deviation_min, 0))), 1) as avg_deviation
+            FROM delay_labels
+            WHERE origin IS NOT NULL AND destination IS NOT NULL
+            GROUP BY origin, destination, day_of_week
+            HAVING total >= 2
+        """).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+
+    stats: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for r in rows:
+        route = f"{r['origin']}_{r['destination']}"
+        dow = r["day_of_week"]
+        stats.setdefault(route, {})[dow] = {
+            "delay_rate": round(r["delayed"] / r["total"], 4) if r["total"] > 0 else 0,
+            "avg_deviation": r["avg_deviation"] or 0,
+            "count": r["total"],
+        }
+    return stats
+
+
 def get_flight_schedule(
     limit: int = 20,
     db_path: Optional[Path] = None,
+    day_of_week: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     path = db_path or DEFAULT_DB_PATH
     if not path.exists():
         return []
     conn = _connect(path)
     try:
-        rows = conn.execute("""
-            SELECT
-                f.callsign,
-                f.origin_airport,
-                f.destination_airport,
-                COUNT(*) as total_flights,
-                COUNT(DISTINCT f.date) as days_active,
-                ROUND(AVG(
-                    CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS REAL)
-                ), 1) as avg_departure_hour,
-                ROUND(AVG(f.duration_min), 0) as avg_duration_min,
-                SUM(CASE WHEN dl.is_delayed = 1 THEN 1 ELSE 0 END) as delayed_count,
-                ROUND(AVG(ABS(COALESCE(dl.deviation_min, 0))), 1) as avg_abs_deviation,
-                ROUND(MAX(ABS(COALESCE(dl.deviation_min, 0))), 1) as max_deviation
-            FROM opensky_flights f
-               LEFT JOIN delay_labels dl
-                 ON dl.flight_id = COALESCE(f.flight_id, f.icao24 || '_' || f.first_seen)
-                   AND f.origin_airport = dl.origin
-                   AND f.destination_airport = dl.destination
-                   AND f.date = dl.date
-                AND f.date = dl.date
-            WHERE f.callsign IS NOT NULL AND f.callsign != ''
-              AND f.origin_airport IS NOT NULL AND f.destination_airport IS NOT NULL
-              AND f.origin_airport != f.destination_airport
-              AND f.duration_min IS NOT NULL
-            GROUP BY f.callsign, f.origin_airport, f.destination_airport
-            HAVING total_flights >= 2
-            ORDER BY (CAST(delayed_count AS REAL) / total_flights) * avg_abs_deviation DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+        if day_of_week is not None:
+            rows = conn.execute("""
+                SELECT
+                    f.callsign,
+                    f.origin_airport,
+                    f.destination_airport,
+                    COUNT(*) as total_flights,
+                    COUNT(DISTINCT f.date) as days_active,
+                    ROUND(AVG(
+                        CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS REAL)
+                    ), 1) as avg_departure_hour,
+                    ROUND(AVG(f.duration_min), 0) as avg_duration_min,
+                    SUM(CASE WHEN dl.is_delayed = 1 THEN 1 ELSE 0 END) as delayed_count,
+                    ROUND(AVG(ABS(COALESCE(dl.deviation_min, 0))), 1) as avg_abs_deviation,
+                    ROUND(MAX(ABS(COALESCE(dl.deviation_min, 0))), 1) as max_deviation
+                FROM opensky_flights f
+                   LEFT JOIN delay_labels dl
+                     ON dl.flight_id = COALESCE(f.flight_id, f.icao24 || '_' || f.first_seen)
+                       AND f.origin_airport = dl.origin
+                       AND f.destination_airport = dl.destination
+                       AND f.date = dl.date
+                       AND dl.day_of_week = ?
+                WHERE f.callsign IS NOT NULL AND f.callsign != ''
+                  AND f.origin_airport IS NOT NULL AND f.destination_airport IS NOT NULL
+                  AND f.origin_airport != f.destination_airport
+                  AND f.duration_min IS NOT NULL
+                GROUP BY f.callsign, f.origin_airport, f.destination_airport
+                HAVING total_flights >= 2
+                ORDER BY total_flights DESC, days_active DESC
+                LIMIT ?
+            """, (day_of_week, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT
+                    f.callsign,
+                    f.origin_airport,
+                    f.destination_airport,
+                    COUNT(*) as total_flights,
+                    COUNT(DISTINCT f.date) as days_active,
+                    ROUND(AVG(
+                        CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS REAL)
+                    ), 1) as avg_departure_hour,
+                    ROUND(AVG(f.duration_min), 0) as avg_duration_min,
+                    SUM(CASE WHEN dl.is_delayed = 1 THEN 1 ELSE 0 END) as delayed_count,
+                    ROUND(AVG(ABS(COALESCE(dl.deviation_min, 0))), 1) as avg_abs_deviation,
+                    ROUND(MAX(ABS(COALESCE(dl.deviation_min, 0))), 1) as max_deviation
+                FROM opensky_flights f
+                   LEFT JOIN delay_labels dl
+                     ON dl.flight_id = COALESCE(f.flight_id, f.icao24 || '_' || f.first_seen)
+                       AND f.origin_airport = dl.origin
+                       AND f.destination_airport = dl.destination
+                       AND f.date = dl.date
+                WHERE f.callsign IS NOT NULL AND f.callsign != ''
+                  AND f.origin_airport IS NOT NULL AND f.destination_airport IS NOT NULL
+                  AND f.origin_airport != f.destination_airport
+                  AND f.duration_min IS NOT NULL
+                GROUP BY f.callsign, f.origin_airport, f.destination_airport
+                HAVING total_flights >= 2
+                ORDER BY total_flights DESC, days_active DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
     except sqlite3.OperationalError:
         rows = []
     finally:
         conn.close()
+
+    overall_stats: Dict[str, Dict[str, Any]] = {}
+    if day_of_week is not None:
+        try:
+            conn2 = _connect(path)
+            overall_rows = conn2.execute("""
+                SELECT origin, destination,
+                       COUNT(*) as total,
+                       SUM(CASE WHEN is_delayed = 1 THEN 1 ELSE 0 END) as delayed
+                FROM delay_labels
+                WHERE origin IS NOT NULL AND destination IS NOT NULL
+                GROUP BY origin, destination
+                HAVING total >= 2
+            """).fetchall()
+            conn2.close()
+            for r in overall_rows:
+                key = f"{r['origin']}_{r['destination']}"
+                overall_stats[key] = {
+                    "delay_rate": round(r["delayed"] / r["total"], 4) if r["total"] > 0 else 0,
+                    "count": r["total"],
+                }
+        except sqlite3.OperationalError:
+            pass
 
     schedule = []
     for r in rows:
@@ -727,7 +864,46 @@ def get_flight_schedule(
             "avg_deviation_min": r["avg_abs_deviation"],
             "max_deviation_min": r["max_deviation"],
             "anomaly_score": round(delay_rate * r["avg_abs_deviation"] / 100, 1) if r["avg_abs_deviation"] else 0,
+            "dow_delay_rate": round(delay_rate / 100, 4),
+            "overall_delay_rate": overall_stats.get(f"{r['origin_airport']}_{r['destination_airport']}", {}).get("delay_rate", round(delay_rate / 100, 4)),
+            "flight_sequence": 0,
+            "prev_flight_delay_min": None,
+            "is_return_leg": False,
         })
+
+    if schedule:
+        callsigns = [f["callsign"] for f in schedule]
+        placeholders = ",".join("?" for _ in callsigns)
+        try:
+            conn2 = _connect(path)
+            rc_rows = conn2.execute(
+                f"""SELECT rc.callsign, rc.flight_sequence, rc.prev_flight_delay_min,
+                           rc.origin, rc.destination, rc.date,
+                           f.icao24
+                    FROM rotation_chains rc
+                    JOIN opensky_flights f
+                      ON rc.icao24 = f.icao24 AND rc.first_seen = f.first_seen
+                    WHERE rc.callsign IN ({placeholders})
+                    ORDER BY rc.date DESC, rc.callsign, rc.flight_sequence""",
+                callsigns,
+            ).fetchall()
+            conn2.close()
+
+            seen_callsigns: set = set()
+            for rc_row in rc_rows:
+                cs = rc_row["callsign"]
+                if cs in seen_callsigns:
+                    continue
+                seen_callsigns.add(cs)
+                for flight in schedule:
+                    if flight["callsign"] == cs:
+                        flight["flight_sequence"] = rc_row["flight_sequence"]
+                        flight["prev_flight_delay_min"] = rc_row["prev_flight_delay_min"]
+                        flight["is_return_leg"] = rc_row["flight_sequence"] > 0
+                        break
+        except sqlite3.OperationalError:
+            pass
+
     return schedule
 
 
@@ -927,24 +1103,33 @@ def get_model_flights_with_status(
 def get_today_schedule(
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
-    from ml_engine.delay_predictor import predict_delay
+    from ml_engine.delay_predictor import predict_delay, _load_models
 
-    schedule = get_flight_schedule(limit=20, db_path=db_path)
     today = datetime.now(timezone.utc)
+    schedule = get_flight_schedule(limit=20, db_path=db_path, day_of_week=today.weekday())
 
+    _load_models()
+
+    cached_weather: Dict[str, Dict] = {}
     for flight in schedule:
         dep_hour = flight["avg_departure_hour"]
         dep_minute = flight["avg_departure_minute"]
         duration = flight["avg_duration_min"]
+        is_return = flight.get("is_return_leg", False)
 
         scheduled_dep = today.replace(hour=dep_hour, minute=dep_minute, second=0, microsecond=0)
         scheduled_arr = scheduled_dep + timedelta(minutes=duration)
 
-        weather = {}
-        try:
-            weather = get_weather_at_time(scheduled_dep)
-        except Exception:
-            pass
+        weather_key = scheduled_dep.strftime("%Y-%m-%d-%H")
+        if weather_key in cached_weather:
+            weather = cached_weather[weather_key]
+        else:
+            weather = {}
+            try:
+                weather = get_weather_at_time(scheduled_dep)
+            except Exception:
+                pass
+            cached_weather[weather_key] = weather
 
         pred = predict_delay(
             origin=flight["origin"],
@@ -958,6 +1143,8 @@ def get_today_schedule(
             temperature_c=weather.get("temperature_c") or 25,
             pressure_hpa=weather.get("pressure_hpa") or 1013,
             delay_rate_pct=flight.get("delay_rate_pct"),
+            dow_delay_rate=flight.get("dow_delay_rate"),
+            overall_delay_rate=flight.get("overall_delay_rate"),
         )
 
         flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
@@ -975,6 +1162,107 @@ def get_today_schedule(
             "factors": pred.get("factors", []),
             "model_used": pred["model_used"],
         }
+
+        if is_return:
+            flight["leg_type"] = "Return Leg"
+            prev_delay = flight.get("prev_flight_delay_min") or 0
+            turnaround_min = 45 + prev_delay
+            flight["layover_turnaround_min"] = int(turnaround_min)
+            flight["crew_action"] = (
+                f"Layover crew change needed after arrival at {scheduled_arr.strftime('%H:%M')} UTC "
+                f"({int(turnaround_min)}min turnaround) — fresh crew must board before next departure"
+            )
+        else:
+            flight["leg_type"] = "First Leg"
+            flight["layover_turnaround_min"] = None
+            flight["crew_action"] = (
+                f"Pre-departure crew assignment required before {scheduled_dep.strftime('%H:%M')} UTC"
+            )
+
+    return schedule
+
+
+def get_schedule_for_date(
+    target_date,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    from ml_engine.delay_predictor import predict_delay, _load_models
+
+    if isinstance(target_date, str):
+        target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+    dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+    schedule = get_flight_schedule(limit=20, db_path=db_path, day_of_week=dt.weekday())
+
+    _load_models()
+
+    cached_weather: Dict[str, Dict] = {}
+    for flight in schedule:
+        dep_hour = flight["avg_departure_hour"]
+        dep_minute = flight["avg_departure_minute"]
+        duration = flight["avg_duration_min"]
+        is_return = flight.get("is_return_leg", False)
+
+        scheduled_dep = dt.replace(hour=dep_hour, minute=dep_minute, second=0, microsecond=0)
+        scheduled_arr = scheduled_dep + timedelta(minutes=duration)
+
+        weather_key = scheduled_dep.strftime("%Y-%m-%d-%H")
+        if weather_key in cached_weather:
+            weather = cached_weather[weather_key]
+        else:
+            weather = {}
+            try:
+                weather = get_weather_at_time(scheduled_dep)
+            except Exception:
+                pass
+            cached_weather[weather_key] = weather
+
+        pred = predict_delay(
+            origin=flight["origin"],
+            destination=flight["destination"],
+            departure_hour=dep_hour,
+            wind_speed_kmh=weather.get("wind_speed_kmh") or 0,
+            wind_gusts_kmh=weather.get("wind_gusts_kmh") or 0,
+            visibility_m=weather.get("visibility_m") or 10000,
+            cloud_cover_pct=weather.get("cloud_cover_pct") or 0,
+            precipitation_mm=weather.get("precipitation_mm") or 0,
+            temperature_c=weather.get("temperature_c") or 25,
+            pressure_hpa=weather.get("pressure_hpa") or 1013,
+            delay_rate_pct=flight.get("delay_rate_pct"),
+            dow_delay_rate=flight.get("dow_delay_rate"),
+            overall_delay_rate=flight.get("overall_delay_rate"),
+        )
+
+        flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
+        flight["scheduled_arrival"] = scheduled_arr.strftime("%H:%M")
+        flight["weather"] = {
+            "temp_c": weather.get("temperature_c", "N/A"),
+            "wind_kmh": weather.get("wind_speed_kmh", "N/A"),
+            "visibility_m": weather.get("visibility_m", "N/A"),
+            "precipitation_mm": weather.get("precipitation_mm", 0),
+        }
+        flight["prediction"] = {
+            "delay_probability": pred["delay_probability"],
+            "expected_delay_min": pred["expected_delay_min"],
+            "risk_level": pred["risk_level"],
+            "factors": pred.get("factors", []),
+            "model_used": pred["model_used"],
+        }
+
+        if is_return:
+            flight["leg_type"] = "Return Leg"
+            prev_delay = flight.get("prev_flight_delay_min") or 0
+            turnaround_min = 45 + prev_delay
+            flight["layover_turnaround_min"] = int(turnaround_min)
+            flight["crew_action"] = (
+                f"Layover crew change needed after arrival at {scheduled_arr.strftime('%H:%M')} UTC "
+                f"({int(turnaround_min)}min turnaround) — fresh crew must board before next departure"
+            )
+        else:
+            flight["leg_type"] = "First Leg"
+            flight["layover_turnaround_min"] = None
+            flight["crew_action"] = (
+                f"Pre-departure crew assignment required before {scheduled_dep.strftime('%H:%M')} UTC"
+            )
 
     return schedule
 
