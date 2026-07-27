@@ -69,11 +69,10 @@ def _build_chat_context() -> str:
             lines.append("TODAY'S BLR FLIGHTS (20):")
             for f in schedule:
                 lines.append(
-                    "  %s %s->%s dep %02d:%02d %dmin delay_rate=%d%% risk_weight=%.1f" % (
+                    "  %s %s->%s dep %02d:%02d %dmin delay_rate=%d%%" % (
                         f["callsign"], f["origin"], f["destination"],
                         f["avg_departure_hour"], f["avg_departure_minute"],
                         f["avg_duration_min"], f["delay_rate_pct"],
-                        f["delay_rate_pct"] * f["avg_deviation_min"] / 100,
                     )
                 )
     except Exception:
@@ -83,17 +82,15 @@ def _build_chat_context() -> str:
         from data.crew_loader import load_crew
         crew = load_crew(str(DEFAULT_CSV_PATH))
         if crew:
-            lines.append("")
-            lines.append("STANDBY CREW (%d members):" % len(crew))
+            role_counts = {}
             for c in crew:
-                lines.append(
-                    "  %s %s %s duty=%.1fh rolling=%.1fh rest=%s quals=%s" % (
-                        c.crew_id, c.name, c.role.value,
-                        c.current_duty_hours, c.rolling_7_day_hours,
-                        c.rest_status,
-                        ", ".join(q.aircraft_type for q in c.qualifications) if c.qualifications else "None",
-                    )
-                )
+                r = c.role.value
+                role_counts[r] = role_counts.get(r, 0) + 1
+            lines.append("")
+            lines.append("CREW ROSTER: %d total (%s)" % (
+                len(crew),
+                ", ".join("%s=%d" % (r, n) for r, n in sorted(role_counts.items()))
+            ))
     except Exception:
         pass
 
@@ -101,13 +98,18 @@ def _build_chat_context() -> str:
         from data.flights_db import get_flights, get_crew_for_flight
         flights = get_flights(db_path=DEFAULT_DB_PATH)
         if flights:
-            lines.append("")
-            lines.append("CREW ASSIGNMENTS:")
+            assigned_ids = set()
+            flight_summary = []
             for f in flights:
                 assigned = get_crew_for_flight(f.flight_id, DEFAULT_DB_PATH)
-                if assigned:
-                    crew_names = ["%s(%s)" % (a["crew_id"], a["role"]) for a in assigned]
-                    lines.append("  %s: %s" % (f.flight_id, ", ".join(crew_names)))
+                n = len(assigned)
+                for a in assigned:
+                    assigned_ids.add(a["crew_id"])
+                flight_summary.append("%s=%d" % (f.flight_id, n))
+            lines.append("CREW ASSIGNMENTS: %s" % ", ".join(flight_summary))
+            lines.append("ASSIGNED: %d crew | STANDBY: %d crew" % (
+                len(assigned_ids), len(crew) - len(assigned_ids)
+            ))
     except Exception:
         pass
 
