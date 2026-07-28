@@ -11,7 +11,7 @@ def get_passenger_profile(db_path: Optional[Path] = None, flight_id: Optional[st
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         if flight_id:
@@ -62,7 +62,7 @@ def get_baggage_load_profile(db_path: Optional[Path] = None, flight_id: Optional
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         if flight_id:
@@ -105,7 +105,7 @@ def get_demand_by_route(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         route_rows = conn.execute("""
@@ -149,7 +149,7 @@ def predict_baggage_load(db_path: Optional[Path] = None, flight_id: Optional[str
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     try:
         if flight_id:
             pax = conn.execute(
@@ -189,7 +189,7 @@ def get_connecting_pax_analysis(db_path: Optional[Path] = None) -> Dict[str, Any
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         total = conn.execute("SELECT COUNT(*) FROM ops_passengers").fetchone()[0]

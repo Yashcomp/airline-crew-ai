@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
@@ -37,6 +38,19 @@ DISRUPTION_KEYWORDS = (
 VALIDATION_KEYWORDS = (
     "check", "validate", "legal", "can they", "eligible",
     "eligible for", "check crew", "is it legal",
+)
+
+PLANNING_KEYWORDS = (
+    "at risk", "risk of delay", "which flights", "delay on",
+    "delay risk", "predict", "forecast", "planning",
+    "high risk", "medium risk", "risk level",
+)
+
+PLANNING_DATE_PATTERNS = (
+    r"\b(?:on|for)\s+(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*)",
+    r"\b(?:tomorrow|today|next\s+(?:mon|tue|wed|thu|fri|sat|sun)\w*)",
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}",
+    r"\b\d{4}-\d{2}-\d{2}\b",
 )
 
 DELAY_MANAGEMENT_KEYWORDS = (
@@ -105,6 +119,25 @@ def _extract_night_duty(user_input: str) -> bool:
     if any(term in normalized for term in ("day duty", "day shift", "dayflight")):
         return False
     return False
+
+
+def _extract_date(user_input: str) -> Optional[str]:
+    from datetime import date, timedelta
+    normalized = user_input.lower()
+    if "tomorrow" in normalized:
+        return (date.today() + timedelta(days=1)).isoformat()
+    if "today" in normalized:
+        return date.today().isoformat()
+    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", user_input)
+    if match:
+        return match.group(1)
+    try:
+        from dateutil import parser as dateutil_parser
+        parsed = dateutil_parser.parse(normalized, fuzzy=True, default=datetime.now())
+        return parsed.date().isoformat()
+    except Exception:
+        pass
+    return None
 
 
 def _extract_required_counts(user_input: str) -> Dict[str, int]:
@@ -176,6 +209,18 @@ def _classify_with_regex(user_input: str) -> RouteDecision:
             intent="Data_Query", route="data",
             confidence=0.65, mode="regex_fallback", raw_input=user_input,
         )
+    if _contains_any(user_input, PLANNING_KEYWORDS) or any(
+        re.search(p, user_input, re.IGNORECASE) for p in PLANNING_DATE_PATTERNS
+    ):
+        extracted_date = _extract_date(user_input)
+        extraction: Dict[str, Any] = {}
+        if extracted_date:
+            extraction["target_date"] = extracted_date
+        return RouteDecision(
+            intent="Planning_Query", route="planning",
+            extraction=extraction,
+            confidence=0.75, mode="regex_fallback", raw_input=user_input,
+        )
     if _contains_any(user_input, FLIGHT_KEYWORDS):
         return RouteDecision(
             intent="Flight_Status", route="flights",
@@ -207,12 +252,13 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
     )
     prompt = (
         "You are an airline operations router. Classify the user's intent into ONE of: "
-        "Rule_Query, Data_Query, Flight_Status, Schedule_Disruption, Compliance_Check, Delay_Management.\n"
+        "Rule_Query, Data_Query, Flight_Status, Schedule_Disruption, Compliance_Check, Delay_Management, Planning_Query.\n"
         "If Schedule_Disruption, extract: scenario_flight_hours (float), scenario_is_night_duty (bool), "
         "required_counts (dict), flight_ids (list of strings).\n"
         "If Flight_Status, extract: flight_ids (list), origin (string), destination (string).\n"
         "If Compliance_Check, extract: crew_id (string), flight_ids (list).\n"
         "If Delay_Management, extract: flight_ids (list), delay_minutes (int or null), is_cancel (bool).\n"
+        "If Planning_Query, extract: target_date (string, YYYY-MM-DD format if parseable).\n"
         "Return ONLY valid JSON with keys: intent, extraction, confidence.\n\n"
         f"User input: {user_input}"
     )
@@ -229,6 +275,7 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
         "Schedule_Disruption": "solver",
         "Compliance_Check": "compliance",
         "Delay_Management": "delay",
+        "Planning_Query": "planning",
     }
     return RouteDecision(
         intent=intent,
@@ -258,7 +305,7 @@ def _classify_with_groq(user_input: str) -> RouteDecision:
         request_timeout=10,
     )
     system_prompt = """You are an airline operations router. Classify user intent into ONE of these exact strings:
-"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check", "Delay_Management"
+"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check", "Delay_Management", "Planning_Query"
 
 IMPORTANT: Handle typos and misspellings. Words like "dela", "delai", "delat", "delayy" all mean "delay". Words like "cancle", "cancel" mean "cancel".
 
@@ -272,6 +319,10 @@ Use "Data_Query" for ALL crew/staff/roster queries about flights or people:
 - "AI-901 staff", "AI-301 crew", "who is assigned to AI-501", "show me the crew of AI-701"
 - "give me information about its crew", "what staff are on AI-901"
 - "who is CRW001", "show crew list", "available captains"
+
+Use "Planning_Query" for ANY question about flight delay risk, predictions, or forecasts on a specific date:
+- "which flights are at risk on August 3", "delay forecast for tomorrow", "what's the risk level on 2026-08-05"
+- "predict delays on next Friday", "high risk flights on Wednesday"
 
 Use "Rule_Query" for regulations, FDTL rules, rest requirements, SOPs, policies.
 
@@ -301,6 +352,7 @@ Return JSON: {"intent": "...", "extraction": {}, "confidence": 0.9}"""
         "Schedule_Disruption": "solver",
         "Compliance_Check": "compliance",
         "Delay_Management": "delay",
+        "Planning_Query": "planning",
     }
     return RouteDecision(
         intent=intent,
@@ -338,6 +390,10 @@ def route_request(user_input: str) -> Dict[str, Any]:
             extraction["delay_minutes"] = int(float(hour_match.group(1)) * 60)
         elif min_match:
             extraction["delay_minutes"] = int(min_match.group(1))
+    if result.get("intent") == "Planning_Query" and not extraction.get("target_date"):
+        extracted_date = _extract_date(user_input)
+        if extracted_date:
+            extraction["target_date"] = extracted_date
     result["extraction"] = extraction
     return result
 

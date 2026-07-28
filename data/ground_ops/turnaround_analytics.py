@@ -11,7 +11,7 @@ def get_turnaround_profile(db_path: Optional[Path] = None, flight_id: Optional[s
     path = db_path or DEFAULT_DB
     if not path.exists() or not flight_id:
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         flight = conn.execute(
@@ -69,7 +69,7 @@ def get_boarding_efficiency(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute("""
@@ -108,7 +108,7 @@ def get_maintenance_impact(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         ac_rows = conn.execute("""

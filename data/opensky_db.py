@@ -21,7 +21,7 @@ _CALLSIGN_MAP_PATH = Path(__file__).parent / "callsign_map.csv"
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -112,6 +112,25 @@ def init_opensky_tables(db_path: Optional[Path] = None) -> None:
             at_risk INTEGER DEFAULT 0,
             risk_reason TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS prediction_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            callsign TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            date TEXT NOT NULL,
+            predicted_at TEXT NOT NULL,
+            delay_probability REAL,
+            expected_delay_min REAL,
+            risk_level TEXT,
+            actual_delay_min REAL,
+            actual_is_delayed INTEGER,
+            actual_recorded_at TEXT,
+            UNIQUE(callsign, origin, destination, date)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pl_date ON prediction_log(date);
+        CREATE INDEX IF NOT EXISTS idx_pl_callsign ON prediction_log(callsign);
     """)
     conn.commit()
     conn.close()
@@ -1358,4 +1377,201 @@ def sync_opensky_flights_to_db(
         "assigned": assigned,
         "total": len(schedule),
         "message": f"Inserted {inserted} flights, assigned crew to {assigned}, skipped {skipped} existing.",
+    }
+
+
+def log_predictions(
+    today_flights: List[Dict[str, Any]],
+    db_path: Optional[Path] = None,
+    target_date: Optional[str] = None,
+) -> int:
+    path = db_path or DEFAULT_DB_PATH
+    init_opensky_tables(db_path)
+    conn = _connect(path)
+    today_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for f in today_flights:
+        pred = f.get("prediction", {})
+        if not pred:
+            continue
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO prediction_log
+                (callsign, origin, destination, date, predicted_at,
+                 delay_probability, expected_delay_min, risk_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    f["callsign"], f["origin"], f["destination"], today_str, now_iso,
+                    pred["delay_probability"], pred["expected_delay_min"], pred["risk_level"],
+                ),
+            )
+            count += 1
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    conn.close()
+    return count
+
+
+def backfill_predictions(db_path: Optional[Path] = None) -> int:
+    path = db_path or DEFAULT_DB_PATH
+    init_opensky_tables(db_path)
+    conn = _connect(path)
+    dates = conn.execute(
+        "SELECT DISTINCT date FROM delay_labels WHERE date IS NOT NULL ORDER BY date"
+    ).fetchall()
+    existing = conn.execute(
+        "SELECT DISTINCT date FROM prediction_log"
+    ).fetchall()
+    existing_dates = {r["date"] for r in existing}
+    conn.close()
+
+    total = 0
+    for row in dates:
+        d = row["date"]
+        if not d or d in existing_dates:
+            continue
+        try:
+            schedule = get_schedule_for_date(d, db_path=path)
+        except Exception:
+            continue
+        if not schedule:
+            continue
+        log_predictions(schedule, db_path=path, target_date=d)
+        total += len(schedule)
+    return total
+
+
+def update_actuals(db_path: Optional[Path] = None) -> int:
+    path = db_path or DEFAULT_DB_PATH
+    conn = _connect(path)
+    rows = conn.execute(
+        """SELECT id, callsign, origin, destination, date
+           FROM prediction_log
+           WHERE actual_is_delayed IS NULL"""
+    ).fetchall()
+    count = 0
+    for r in rows:
+        actuals = conn.execute(
+            """SELECT deviation_min, is_delayed
+               FROM delay_labels
+               WHERE flight_id = ? AND origin = ? AND destination = ? AND date = ?
+               LIMIT 1""",
+            (r["callsign"], r["origin"], r["destination"], r["date"]),
+        ).fetchall()
+        if actuals:
+            a = actuals[0]
+            actual_delay = a["deviation_min"] if a["deviation_min"] is not None else 0
+            actual_delayed = a["is_delayed"] if a["is_delayed"] is not None else 0
+            conn.execute(
+                """UPDATE prediction_log
+                   SET actual_delay_min = ?, actual_is_delayed = ?, actual_recorded_at = ?
+                   WHERE id = ?""",
+                (round(actual_delay, 1), actual_delayed, datetime.now(timezone.utc).isoformat(), r["id"]),
+            )
+            count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_prediction_audit(days: int = 14, db_path: Optional[Path] = None) -> pd.DataFrame:
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return pd.DataFrame()
+    conn = _connect(path)
+    try:
+        df = pd.read_sql_query(
+            """SELECT callsign, origin, destination, date, predicted_at,
+                      delay_probability, expected_delay_min, risk_level,
+                      actual_delay_min, actual_is_delayed
+               FROM prediction_log
+               WHERE actual_is_delayed IS NOT NULL
+                 AND date >= date('now', ?)
+               ORDER BY date DESC, delay_probability DESC""",
+            conn,
+            params=(f"-{days} days",),
+        )
+    except sqlite3.OperationalError:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    return df
+
+
+def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
+    if audit_df.empty:
+        return {"total": 0, "message": "No audit data available."}
+
+    total = len(audit_df)
+    predicted_high_med = audit_df["risk_level"].isin(["High", "Medium"])
+    predicted_low = audit_df["risk_level"] == "Low"
+    actually_delayed = audit_df["actual_is_delayed"] == 1
+    actually_not_delayed = audit_df["actual_is_delayed"] == 0
+
+    tp = int((predicted_high_med & actually_delayed).sum())
+    fp = int((predicted_high_med & actually_not_delayed).sum())
+    tn = int((predicted_low & actually_not_delayed).sum())
+    fn = int((predicted_low & actually_delayed).sum())
+
+    accuracy = round((tp + tn) / total * 100, 1) if total > 0 else 0
+    precision = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else 0
+    recall = round(tp / (tp + fn) * 100, 1) if (tp + fn) > 0 else 0
+    f1 = round(2 * precision * recall / (precision + recall), 1) if (precision + recall) > 0 else 0
+
+    mask = audit_df["actual_delay_min"].notna()
+    mae = round(audit_df.loc[mask, "expected_delay_min"].sub(audit_df.loc[mask, "actual_delay_min"].abs()).abs().mean(), 1) if mask.any() else 0
+    mae_simple = round((audit_df.loc[mask, "expected_delay_min"] - audit_df.loc[mask, "actual_delay_min"].abs()).abs().mean(), 1) if mask.any() else 0
+
+    brier = 0.0
+    if total > 0:
+        probs = audit_df["delay_probability"].clip(0, 1)
+        actuals = audit_df["actual_is_delayed"].astype(float)
+        brier = round(((probs - actuals) ** 2).mean(), 4)
+
+    calibration = []
+    for lo in range(0, 100, 10):
+        hi = lo + 10
+        bucket = audit_df[(audit_df["delay_probability"] * 100 >= lo) & (audit_df["delay_probability"] * 100 < hi)]
+        if len(bucket) > 0:
+            calibration.append({
+                "bucket": f"{lo}-{hi}%",
+                "predicted_avg": round(bucket["delay_probability"].mean() * 100, 1),
+                "actual_rate": round(bucket["actual_is_delayed"].mean() * 100, 1),
+                "count": len(bucket),
+            })
+
+    risk_dist = []
+    for level in ["High", "Medium", "Low"]:
+        sub = audit_df[audit_df["risk_level"] == level]
+        if len(sub) > 0:
+            risk_dist.append({
+                "risk_level": level,
+                "count": len(sub),
+                "actual_delay_rate": round(sub["actual_is_delayed"].mean() * 100, 1),
+                "avg_predicted_prob": round(sub["delay_probability"].mean() * 100, 1),
+                "avg_actual_delay_min": round(sub["actual_delay_min"].abs().mean(), 1) if sub["actual_delay_min"].notna().any() else 0,
+            })
+
+    audit_df = audit_df.copy()
+    audit_df["predicted_delayed"] = audit_df["risk_level"].isin(["High", "Medium"])
+    audit_df["match"] = audit_df.apply(
+        lambda r: "Correct" if r["predicted_delayed"] == bool(r["actual_is_delayed"])
+        else ("Miss" if r["actual_is_delayed"] == 1 else "False Alarm"),
+        axis=1,
+    )
+
+    return {
+        "total": total,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "mae": mae_simple,
+        "brier_score": brier,
+        "calibration": calibration,
+        "risk_distribution": risk_dist,
+        "predictions": audit_df[["date", "callsign", "origin", "destination", "delay_probability",
+                                  "risk_level", "actual_delay_min", "actual_is_delayed", "match"]].to_dict("records"),
     }

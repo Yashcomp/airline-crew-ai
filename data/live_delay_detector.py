@@ -13,7 +13,7 @@ DELAY_THRESHOLD_MIN = 15
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 

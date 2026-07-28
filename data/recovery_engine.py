@@ -11,7 +11,7 @@ def assess_disruption_impact(db_path: Optional[Path] = None, flight_id: Optional
     path = db_path or DEFAULT_DB
     if not path.exists() or not flight_id:
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         flight = conn.execute(
@@ -97,7 +97,7 @@ def find_recovery_options(db_path: Optional[Path] = None, flight_id: Optional[st
     path = db_path or DEFAULT_DB
     if not path.exists() or not flight_id:
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         flight = conn.execute(
@@ -187,7 +187,7 @@ def get_disruption_cascade(db_path: Optional[Path] = None, flight_id: Optional[s
     path = db_path or DEFAULT_DB
     if not path.exists() or not flight_id:
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         flight = conn.execute(

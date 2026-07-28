@@ -13,7 +13,7 @@ def get_staff_role_distribution(db_path: Optional[Path] = None) -> Dict[str, Any
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
@@ -36,7 +36,7 @@ def get_shift_coverage_analysis(db_path: Optional[Path] = None) -> Dict[str, Any
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     try:
         shift_rows = conn.execute("""
             SELECT
@@ -112,7 +112,7 @@ def get_staff_utilization(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     try:
         staff_ids = [r["staff_id"] for r in conn.execute("SELECT staff_id FROM ops_staff").fetchall()]
         total_shifts = conn.execute("SELECT COUNT(*) FROM ops_shifts").fetchone()[0]
@@ -154,7 +154,7 @@ def get_staff_shift_summary(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=30)
     try:
         total = conn.execute("SELECT COUNT(*) FROM ops_shifts").fetchone()[0]
         avg_hours = conn.execute("SELECT AVG(shift_hours) FROM ops_shifts").fetchone()[0] or 0
