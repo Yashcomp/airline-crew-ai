@@ -11,8 +11,9 @@ def get_turnaround_profile(db_path: Optional[Path] = None, flight_id: Optional[s
     path = db_path or DEFAULT_DB
     if not path.exists() or not flight_id:
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         flight = conn.execute(
             "SELECT * FROM ops_flights WHERE flight_id = ?", (flight_id,)
@@ -69,8 +70,9 @@ def get_boarding_efficiency(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         rows = conn.execute("""
             SELECT ge.flight_id, ge.duration_min,
@@ -108,8 +110,9 @@ def get_maintenance_impact(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         ac_rows = conn.execute("""
             SELECT aircraft_reg,

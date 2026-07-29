@@ -31,31 +31,45 @@ DEFAULT_DB_PATH = Path(__file__).parent / "flights.db"
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn = sqlite3.connect(str(db_path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return conn
+
+
+def _connect_write(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return conn
 
 
 def init_weather_table(db_path: Optional[Path] = None) -> None:
     path = db_path or DEFAULT_DB_PATH
-    conn = _connect(path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS weather_cache (
-            timestamp TEXT PRIMARY KEY,
-            temperature_c REAL,
-            wind_speed_kmh REAL,
-            wind_direction_deg REAL,
-            wind_gusts_kmh REAL,
-            visibility_m REAL,
-            cloud_cover_pct REAL,
-            cloud_cover_low_pct REAL,
-            precipitation_mm REAL,
-            pressure_hpa REAL,
-            weather_code INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
+    conn = _connect_write(path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS weather_cache (
+                timestamp TEXT PRIMARY KEY,
+                temperature_c REAL,
+                wind_speed_kmh REAL,
+                wind_direction_deg REAL,
+                wind_gusts_kmh REAL,
+                visibility_m REAL,
+                cloud_cover_pct REAL,
+                cloud_cover_low_pct REAL,
+                precipitation_mm REAL,
+                pressure_hpa REAL,
+                weather_code INTEGER
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_historical_weather(
@@ -216,27 +230,36 @@ def _get_cached_weather(date_str: str, db_path: Optional[Path] = None) -> List[D
 def _cache_weather(records: List[Dict[str, Any]], db_path: Optional[Path] = None) -> None:
     path = db_path or DEFAULT_DB_PATH
     init_weather_table(db_path)
-    conn = _connect(path)
-    for r in records:
+    for attempt in range(10):
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO weather_cache
-                (timestamp, temperature_c, wind_speed_kmh, wind_direction_deg,
-                 wind_gusts_kmh, visibility_m, cloud_cover_pct, cloud_cover_low_pct,
-                 precipitation_mm, pressure_hpa, weather_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    r.get("timestamp"), r.get("temperature_c"), r.get("wind_speed_kmh"),
-                    r.get("wind_direction_deg"), r.get("wind_gusts_kmh"),
-                    r.get("visibility_m"), r.get("cloud_cover_pct"),
-                    r.get("cloud_cover_low_pct"), r.get("precipitation_mm"),
-                    r.get("pressure_hpa"), r.get("weather_code"),
-                ),
-            )
-        except sqlite3.IntegrityError:
-            pass
-    conn.commit()
-    conn.close()
+            conn = _connect_write(path)
+            try:
+                for r in records:
+                    try:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO weather_cache
+                            (timestamp, temperature_c, wind_speed_kmh, wind_direction_deg,
+                             visibility_m, cloud_cover_pct, cloud_cover_low_pct,
+                             precipitation_mm, pressure_hpa, weather_code)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                r.get("timestamp"), r.get("temperature_c"), r.get("wind_speed_kmh"),
+                                r.get("wind_direction_deg"), r.get("visibility_m"),
+                                r.get("cloud_cover_pct"), r.get("cloud_cover_low_pct"),
+                                r.get("precipitation_mm"), r.get("pressure_hpa"),
+                                r.get("weather_code"),
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        pass
+                conn.commit()
+            finally:
+                conn.close()
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e) or attempt == 9:
+                raise
+            time.sleep(min(0.5 * (attempt + 1), 3))
 
 
 def bulk_cache_weather(

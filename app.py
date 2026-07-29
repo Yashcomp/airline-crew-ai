@@ -1043,7 +1043,7 @@ with tab_forecast:
         else:
             st.info(f"**{_os_stats['total_flights']}** flights stored")
 
-    col_seed, col_brief = st.columns(2)
+    col_seed, col_brief, col_retrain = st.columns(3)
     with col_seed:
         seed_days = st.slider("Days to seed", 1, 60, 30, key="seed_days",
                               help="Fetch historical flight data from OpenSky. Existing days are skipped automatically.")
@@ -1073,16 +1073,32 @@ with tab_forecast:
             st.rerun()
     with col_brief:
         if st.button("Run Daily Briefing", type="primary", help="Seeds yesterday's data, predicts delays, suggests crew."):
-            with st.spinner("Updating data + predicting delays + finding crew..."):
-                update_result = update_daily_data(days_back=1, db_path=DEFAULT_DB_PATH)
+            with st.spinner("Running Daily Briefing — updating data, predicting delays, assigning crew..."):
+                t0 = time.perf_counter()
+                update_result = update_daily_data(days_back=1, db_path=DEFAULT_DB_PATH, retrain=False)
+                t1 = time.perf_counter(); print(f"[perf] update_daily_data: {t1-t0:.2f}s")
                 today_flights = get_today_schedule(db_path=DEFAULT_DB_PATH)
+                t2 = time.perf_counter(); print(f"[perf] get_today_schedule: {t2-t1:.2f}s")
                 crew_plan = proactive_crew_assignment(today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
+                t3 = time.perf_counter(); print(f"[perf] proactive_crew_assignment: {t3-t2:.2f}s")
                 at_risk = get_at_risk_crew(str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
+                t4 = time.perf_counter(); print(f"[perf] get_at_risk_crew: {t4-t3:.2f}s")
                 log_predictions(today_flights, DEFAULT_DB_PATH)
+                t5 = time.perf_counter(); print(f"[perf] log_predictions: {t5-t4:.2f}s")
                 update_actuals(DEFAULT_DB_PATH)
+                t6 = time.perf_counter(); print(f"[perf] update_actuals: {t6-t5:.2f}s")
+                print(f"[perf] TOTAL briefing: {t6-t0:.2f}s")
             st.session_state["today_flights"] = today_flights
             st.session_state["crew_plan"] = crew_plan
             st.session_state["at_risk_crew"] = at_risk
+            st.rerun()
+
+    with col_retrain:
+        if st.button("Retrain Models", help="Retrain XGBoost delay prediction models with latest data."):
+            with st.spinner("Retraining models..."):
+                from ml_engine.delay_predictor import retrain_if_stale
+                r = retrain_if_stale(max_age_hours=0, db_path=DEFAULT_DB_PATH)
+            st.success(f"Models: {r.get('status', 'done')}")
             st.rerun()
 
     today_flights = st.session_state.get("today_flights", [])
@@ -1110,20 +1126,12 @@ with tab_forecast:
 
         st.divider()
 
-        risk_order = {"High": 0, "Medium": 1}
-        high_med = sorted(
-            [f for f in today_flights if f["prediction"]["risk_level"] in ("High", "Medium")],
-            key=lambda x: (risk_order.get(x["prediction"]["risk_level"], 2), -x["prediction"]["delay_probability"]),
-        )
-        if high_med:
-            st.subheader("Flights Requiring Attention")
-
-            recs = crew_plan.get("crew_recommendations", {})
-            crew_name_df = pd.read_csv(DEFAULT_CSV_PATH)
-            crew_name_map = dict(zip(crew_name_df["crew_id"], crew_name_df["name"]))
-            for f in high_med:
+        recs = crew_plan.get("crew_recommendations", {})
+        crew_name_df = pd.read_csv(DEFAULT_CSV_PATH)
+        crew_name_map = dict(zip(crew_name_df["crew_id"], crew_name_df["name"]))
+        for f in today_flights:
                 pred = f["prediction"]
-                risk_color = "red" if pred["risk_level"] == "High" else "orange"
+                risk_color = "red" if pred["risk_level"] == "High" else ("orange" if pred["risk_level"] == "Medium" else "gray")
                 wx = f.get("weather", {})
                 fid = f["callsign"]
                 rec = recs.get(fid, {})
@@ -1148,47 +1156,26 @@ with tab_forecast:
                         else:
                             st.warning(f"**{crew_action}**")
 
-                    if at_risk:
-                        assigned_crew = get_crew_for_flight(fid, DEFAULT_DB_PATH)
-                        at_risk_lookup = {}
-                        for entry in at_risk.get("violating", []) + at_risk.get("critical", []) + at_risk.get("warnings", []):
-                            at_risk_lookup[entry["crew_id"]] = entry
-                        flagged = []
-                        for ac in assigned_crew:
-                            cid = ac.get("crew_id", "")
-                            if cid in at_risk_lookup:
-                                flagged.append((cid, ac.get("role", ""), at_risk_lookup[cid]))
-                        if flagged:
-                            for cid, role, entry in flagged:
-                                sev = entry["severity"]
-                                icon = ":red[!]" if sev == "violating" else ":orange[!]" if sev == "critical" else ":blue[!]"
-                                checks_str = "; ".join(c["metric"] for c in entry["checks"])
-                                sug = suggestions.get(role)
-                                if sug:
-                                    sug_tier = sug.get("tier", 0)
-                                    sug_tag = ":green[Standby]" if sug_tier == 0 else f":orange[On {sug.get('assigned_flight', '')}]"
-                                    st.markdown(f"{icon} **{cid} {entry['name']}** ({role}) — {checks_str} → Replace with **{sug['name']}** ({sug['crew_id']}, {sug_tag}, Duty {sug['duty_hours']}h)")
-                                else:
-                                    st.markdown(f"{icon} **{cid} {entry['name']}** ({role}) — {checks_str} → :warning[No replacement available]")
-
                     col_wx, col_hist = st.columns(2)
                     col_wx.caption(f"Weather: {wx.get('temp_c', '?')}C, Wind {wx.get('wind_kmh', '?')}km/h, Precip {wx.get('precipitation_mm', 0)}mm")
                     col_hist.caption(f"History: {f['delay_rate_pct']}% delay rate, avg deviation {f['avg_deviation_min']}min across {f['total_flights']} flights")
 
                     if suggestions:
-                        current_crew = get_crew_for_flight(fid, DEFAULT_DB_PATH)
-                        current_by_role = {}
-                        for ac in current_crew:
-                            r = ac.get("role", "")
-                            if r not in current_by_role:
-                                current_by_role[r] = []
-                            current_by_role[r].append(ac)
-
                         replacement_lines = []
                         for role_name, sug in suggestions.items():
-                            holders = current_by_role.get(role_name, [])
-                            old_cid = holders[0]["crew_id"] if holders else None
-                            old_name = crew_name_map.get(old_cid, old_cid) if old_cid else "(unassigned)"
+                            old_cid = sug.get("old_crew_id")
+                            old_name = sug.get("old_crew_name")
+                            if not old_cid or not old_name:
+                                current_crew = get_crew_for_flight(fid, DEFAULT_DB_PATH)
+                                current_by_role = {}
+                                for ac in current_crew:
+                                    r = ac.get("role", "")
+                                    if r not in current_by_role:
+                                        current_by_role[r] = []
+                                    current_by_role[r].append(ac)
+                                holders = current_by_role.get(role_name, [])
+                                old_cid = holders[0]["crew_id"] if holders else None
+                                old_name = crew_name_map.get(old_cid, old_cid) if old_cid else "(unassigned)"
                             replacement_lines.append(f"**{role_name}**: {old_name} → **{sug['name']}** ({sug['crew_id']})")
 
                         if replacement_lines:
@@ -1223,13 +1210,23 @@ with tab_forecast:
                                 if reassigned_count:
                                     msg += f"\n\n({reassigned_count} reassigned from other flights)"
                                 st.success(msg)
+                                st.session_state["crew_plan"] = proactive_crew_assignment(
+                                    today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH
+                                )
                                 st.rerun()
                             elif already_assigned_count > 0:
                                 st.warning(f"{already_assigned_count} crew already assigned to {fid}. Check if backup is actually needed.")
                             else:
                                 st.error(f"Assignment failed for {failed_count} crew. They may have DGCA violations.")
-                    elif rec.get("standby_count", 0) == 0:
-                        st.warning("No DGCA-compliant crew available for this flight. All crew may be on High-risk flights or violate duty limits.")
+                    elif fid in recs:
+                        standby_count = rec.get("standby_count", 0)
+                        if pred["risk_level"] in ("High", "Medium"):
+                            if standby_count > 0:
+                                st.success(f"Crew is DGCA-compliant. **{standby_count}** standby crew available as backup.")
+                            else:
+                                st.warning("No DGCA-compliant standby crew available for this flight.")
+                        else:
+                            st.info("Crew is DGCA-compliant. No changes needed.")
 
                     st.divider()
 

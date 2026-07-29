@@ -13,9 +13,33 @@ DELAY_THRESHOLD_MIN = 15
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn = sqlite3.connect(str(db_path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return conn
+
+
+def _connect_write(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return conn
+
+
+def _retry_on_lock(fn, max_retries=10, delay=0.5):
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e):
+                raise
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(min(delay * (attempt + 1), 3))
 
 
 def load_tracked_flights(
@@ -329,35 +353,39 @@ def store_realtime_delays(
 ) -> None:
     path = db_path or DEFAULT_DB_PATH
     _init_realtime_delays_table(path)
-    conn = _connect(path)
-    conn.execute("DELETE FROM realtime_delays")
-    for d in delays:
+    def _write():
+        conn = _connect_write(path)
         try:
-            conn.execute(
-                """INSERT INTO realtime_delays
-                (flight_id, callsign, status, scheduled_departure,
-                 actual_departure, delay_minutes, last_seen, detected_at,
-                 origin, destination, at_risk, risk_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    d.get("flight_id"),
-                    d.get("callsign"),
-                    d.get("status"),
-                    d.get("scheduled_departure"),
-                    d.get("actual_departure"),
-                    d.get("delay_minutes"),
-                    d.get("last_seen"),
-                    int(time.time()),
-                    d.get("origin"),
-                    d.get("destination"),
-                    1 if d.get("at_risk") else 0,
-                    d.get("risk_reason"),
-                ),
-            )
-        except sqlite3.IntegrityError:
-            pass
-    conn.commit()
-    conn.close()
+            conn.execute("DELETE FROM realtime_delays")
+            for d in delays:
+                try:
+                    conn.execute(
+                        """INSERT INTO realtime_delays
+                        (flight_id, callsign, status, scheduled_departure,
+                         actual_departure, delay_minutes, last_seen, detected_at,
+                         origin, destination, at_risk, risk_reason)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            d.get("flight_id"),
+                            d.get("callsign"),
+                            d.get("status"),
+                            d.get("scheduled_departure"),
+                            d.get("actual_departure"),
+                            d.get("delay_minutes"),
+                            d.get("last_seen"),
+                            int(time.time()),
+                            d.get("origin"),
+                            d.get("destination"),
+                            1 if d.get("at_risk") else 0,
+                            d.get("risk_reason"),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+            conn.commit()
+        finally:
+            conn.close()
+    _retry_on_lock(_write)
 
 
 def get_realtime_delays(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -387,22 +415,24 @@ def get_realtime_delays(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
 
 
 def _init_realtime_delays_table(db_path: Path) -> None:
-    conn = _connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS realtime_delays (
-            flight_id TEXT,
-            callsign TEXT PRIMARY KEY,
-            status TEXT,
-            scheduled_departure TEXT,
-            actual_departure INTEGER,
-            delay_minutes INTEGER,
-            last_seen INTEGER,
-            detected_at INTEGER,
-            origin TEXT,
-            destination TEXT,
-            at_risk INTEGER DEFAULT 0,
-            risk_reason TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+    conn = _connect_write(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS realtime_delays (
+                flight_id TEXT,
+                callsign TEXT PRIMARY KEY,
+                status TEXT,
+                scheduled_departure TEXT,
+                actual_departure INTEGER,
+                delay_minutes INTEGER,
+                last_seen INTEGER,
+                detected_at INTEGER,
+                origin TEXT,
+                destination TEXT,
+                at_risk INTEGER DEFAULT 0,
+                risk_reason TEXT
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()

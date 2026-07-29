@@ -12,6 +12,7 @@ import pandas as pd
 from data.opensky_client import OpenSkyClient, utc_day_range
 from data.weather_client import (
     bulk_cache_weather, get_current_weather, get_weather_at_time,
+    get_historical_weather, get_forecast_weather, _cache_weather,
     init_weather_table, kmh_to_knots,
 )
 
@@ -21,15 +22,38 @@ _CALLSIGN_MAP_PATH = Path(__file__).parent / "callsign_map.csv"
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn = sqlite3.connect(str(db_path), timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return conn
+
+
+def _connect_write(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return conn
+
+
+def _retry_on_lock(fn, max_retries=10, delay=0.5):
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e):
+                raise
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(min(delay * (attempt + 1), 3))
 
 
 def init_opensky_tables(db_path: Optional[Path] = None) -> None:
     path = db_path or DEFAULT_DB_PATH
-    conn = _connect(path)
+    conn = _connect_write(path)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS opensky_flights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1125,11 +1149,28 @@ def get_today_schedule(
     from ml_engine.delay_predictor import predict_delay, _load_models
 
     today = datetime.now(timezone.utc)
-    schedule = get_flight_schedule(limit=20, db_path=db_path, day_of_week=today.weekday())
+    schedule = get_flight_schedule(limit=20, db_path=db_path)
 
     _load_models()
 
     cached_weather: Dict[str, Dict] = {}
+    today_str = today.strftime("%Y-%m-%d")
+    try:
+        records = get_historical_weather(today_str, today_str)
+        if not records:
+            records = get_forecast_weather(today_str, today_str)
+        if records:
+            _cache_weather(records)
+            for r in records:
+                ts = r.get("timestamp", "")
+                if isinstance(ts, str):
+                    for h in range(24):
+                        if f"T{h:02d}" in ts:
+                            cached_weather[f"{today_str}-{h:02d}"] = r
+                            break
+    except Exception:
+        pass
+
     for flight in schedule:
         dep_hour = flight["avg_departure_hour"]
         dep_minute = flight["avg_departure_minute"]
@@ -1140,15 +1181,12 @@ def get_today_schedule(
         scheduled_arr = scheduled_dep + timedelta(minutes=duration)
 
         weather_key = scheduled_dep.strftime("%Y-%m-%d-%H")
-        if weather_key in cached_weather:
-            weather = cached_weather[weather_key]
-        else:
-            weather = {}
+        weather = cached_weather.get(weather_key, {})
+        if not weather:
             try:
                 weather = get_weather_at_time(scheduled_dep)
             except Exception:
                 pass
-            cached_weather[weather_key] = weather
 
         pred = predict_delay(
             origin=flight["origin"],
@@ -1215,6 +1253,23 @@ def get_schedule_for_date(
     _load_models()
 
     cached_weather: Dict[str, Dict] = {}
+    dt_str = dt.strftime("%Y-%m-%d")
+    try:
+        records = get_historical_weather(dt_str, dt_str)
+        if not records:
+            records = get_forecast_weather(dt_str, dt_str)
+        if records:
+            _cache_weather(records)
+            for r in records:
+                ts = r.get("timestamp", "")
+                if isinstance(ts, str):
+                    for h in range(24):
+                        if f"T{h:02d}" in ts:
+                            cached_weather[f"{dt_str}-{h:02d}"] = r
+                            break
+    except Exception:
+        pass
+
     for flight in schedule:
         dep_hour = flight["avg_departure_hour"]
         dep_minute = flight["avg_departure_minute"]
@@ -1225,15 +1280,12 @@ def get_schedule_for_date(
         scheduled_arr = scheduled_dep + timedelta(minutes=duration)
 
         weather_key = scheduled_dep.strftime("%Y-%m-%d-%H")
-        if weather_key in cached_weather:
-            weather = cached_weather[weather_key]
-        else:
-            weather = {}
+        weather = cached_weather.get(weather_key, {})
+        if not weather:
             try:
                 weather = get_weather_at_time(scheduled_dep)
             except Exception:
                 pass
-            cached_weather[weather_key] = weather
 
         pred = predict_delay(
             origin=flight["origin"],
@@ -1289,22 +1341,25 @@ def get_schedule_for_date(
 def update_daily_data(
     days_back: int = 1,
     db_path: Optional[Path] = None,
+    retrain: bool = True,
 ) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB_PATH
     result = seed_historical_data(days=days_back, db_path=path)
 
     labels_added = 0
-    try:
-        labels_added = compute_delay_labels(path)
-    except Exception:
-        pass
+    if retrain:
+        try:
+            labels_added = compute_delay_labels(path)
+        except Exception:
+            pass
 
     model_result = {"status": "skipped"}
-    try:
-        from ml_engine.delay_predictor import retrain_if_stale
-        model_result = retrain_if_stale(max_age_hours=12, db_path=path)
-    except Exception:
-        pass
+    if retrain:
+        try:
+            from ml_engine.delay_predictor import retrain_if_stale
+            model_result = retrain_if_stale(max_age_hours=12, db_path=path)
+        except Exception:
+            pass
 
     return {
         "seed": result,
@@ -1320,11 +1375,12 @@ def sync_opensky_flights_to_db(
     csv_path: Optional[str] = None,
     db_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    from data.flights_db import insert_flight, get_flight
+    from data.flights_db import insert_flight, get_flight, get_crew_for_flight
     from data.models import Flight, FlightStatus
-    from data.staff_manager import auto_assign_flight
+    from data.staff_manager import auto_assign_flight, REQUIRED_CREW
 
     path = db_path or DEFAULT_DB_PATH
+    today = datetime.now()
     schedule = get_flight_schedule(limit=20, db_path=path)
     if not schedule:
         return {"inserted": 0, "assigned": 0, "message": "No flights in schedule."}
@@ -1332,16 +1388,22 @@ def sync_opensky_flights_to_db(
     if csv_path is None:
         csv_path = str(Path(__file__).parent.parent / "crew_standby_list.csv")
 
-    today = datetime.now()
     inserted = 0
     assigned = 0
     skipped = 0
+    filled = 0
 
     for f in schedule:
         fid = f["callsign"]
         existing = get_flight(fid, path)
         if existing:
-            skipped += 1
+            existing_crew = get_crew_for_flight(fid, path)
+            if len(existing_crew) >= sum(REQUIRED_CREW.values()):
+                skipped += 1
+            else:
+                result = auto_assign_flight(fid, csv_path, path)
+                if result.get("assigned_count", 0) > 0:
+                    filled += 1
             continue
 
         dep_hour = f["avg_departure_hour"]
@@ -1373,10 +1435,11 @@ def sync_opensky_flights_to_db(
 
     return {
         "inserted": inserted,
+        "filled": filled,
         "skipped": skipped,
         "assigned": assigned,
         "total": len(schedule),
-        "message": f"Inserted {inserted} flights, assigned crew to {assigned}, skipped {skipped} existing.",
+        "message": f"Inserted {inserted} flights, assigned crew to {assigned}, backfilled {filled} existing flights, skipped {skipped} (already full).",
     }
 
 
@@ -1386,46 +1449,53 @@ def log_predictions(
     target_date: Optional[str] = None,
 ) -> int:
     path = db_path or DEFAULT_DB_PATH
-    init_opensky_tables(db_path)
-    conn = _connect(path)
-    today_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    now_iso = datetime.now(timezone.utc).isoformat()
-    count = 0
-    for f in today_flights:
-        pred = f.get("prediction", {})
-        if not pred:
-            continue
+
+    def _write():
+        conn = _connect_write(path)
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO prediction_log
-                (callsign, origin, destination, date, predicted_at,
-                 delay_probability, expected_delay_min, risk_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    f["callsign"], f["origin"], f["destination"], today_str, now_iso,
-                    pred["delay_probability"], pred["expected_delay_min"], pred["risk_level"],
-                ),
-            )
-            count += 1
-        except sqlite3.IntegrityError:
-            pass
-    conn.commit()
-    conn.close()
-    return count
+            today_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            now_iso = datetime.now(timezone.utc).isoformat()
+            count = 0
+            for f in today_flights:
+                pred = f.get("prediction", {})
+                if not pred:
+                    continue
+                try:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO prediction_log
+                        (callsign, origin, destination, date, predicted_at,
+                         delay_probability, expected_delay_min, risk_level)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            f["callsign"], f["origin"], f["destination"], today_str, now_iso,
+                            pred["delay_probability"], pred["expected_delay_min"], pred["risk_level"],
+                        ),
+                    )
+                    count += 1
+                except sqlite3.IntegrityError:
+                    pass
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    return _retry_on_lock(_write)
 
 
 def backfill_predictions(db_path: Optional[Path] = None) -> int:
     path = db_path or DEFAULT_DB_PATH
     init_opensky_tables(db_path)
     conn = _connect(path)
-    dates = conn.execute(
-        "SELECT DISTINCT date FROM delay_labels WHERE date IS NOT NULL ORDER BY date"
-    ).fetchall()
-    existing = conn.execute(
-        "SELECT DISTINCT date FROM prediction_log"
-    ).fetchall()
-    existing_dates = {r["date"] for r in existing}
-    conn.close()
+    try:
+        dates = conn.execute(
+            "SELECT DISTINCT date FROM delay_labels WHERE date IS NOT NULL ORDER BY date"
+        ).fetchall()
+        existing = conn.execute(
+            "SELECT DISTINCT date FROM prediction_log"
+        ).fetchall()
+        existing_dates = {r["date"] for r in existing}
+    finally:
+        conn.close()
 
     total = 0
     for row in dates:
@@ -1445,35 +1515,41 @@ def backfill_predictions(db_path: Optional[Path] = None) -> int:
 
 def update_actuals(db_path: Optional[Path] = None) -> int:
     path = db_path or DEFAULT_DB_PATH
-    conn = _connect(path)
-    rows = conn.execute(
-        """SELECT id, callsign, origin, destination, date
-           FROM prediction_log
-           WHERE actual_is_delayed IS NULL"""
-    ).fetchall()
-    count = 0
-    for r in rows:
-        actuals = conn.execute(
-            """SELECT deviation_min, is_delayed
-               FROM delay_labels
-               WHERE flight_id = ? AND origin = ? AND destination = ? AND date = ?
-               LIMIT 1""",
-            (r["callsign"], r["origin"], r["destination"], r["date"]),
-        ).fetchall()
-        if actuals:
-            a = actuals[0]
-            actual_delay = a["deviation_min"] if a["deviation_min"] is not None else 0
-            actual_delayed = a["is_delayed"] if a["is_delayed"] is not None else 0
-            conn.execute(
-                """UPDATE prediction_log
-                   SET actual_delay_min = ?, actual_is_delayed = ?, actual_recorded_at = ?
-                   WHERE id = ?""",
-                (round(actual_delay, 1), actual_delayed, datetime.now(timezone.utc).isoformat(), r["id"]),
-            )
-            count += 1
-    conn.commit()
-    conn.close()
-    return count
+
+    def _write():
+        conn = _connect_write(path)
+        try:
+            rows = conn.execute(
+                """SELECT id, callsign, origin, destination, date
+                   FROM prediction_log
+                   WHERE actual_is_delayed IS NULL"""
+            ).fetchall()
+            count = 0
+            for r in rows:
+                actuals = conn.execute(
+                    """SELECT deviation_min, is_delayed
+                       FROM delay_labels
+                       WHERE flight_id = ? AND origin = ? AND destination = ? AND date = ?
+                       LIMIT 1""",
+                    (r["callsign"], r["origin"], r["destination"], r["date"]),
+                ).fetchall()
+                if actuals:
+                    a = actuals[0]
+                    actual_delay = a["deviation_min"] if a["deviation_min"] is not None else 0
+                    actual_delayed = a["is_delayed"] if a["is_delayed"] is not None else 0
+                    conn.execute(
+                        """UPDATE prediction_log
+                           SET actual_delay_min = ?, actual_is_delayed = ?, actual_recorded_at = ?
+                           WHERE id = ?""",
+                        (round(actual_delay, 1), actual_delayed, datetime.now(timezone.utc).isoformat(), r["id"]),
+                    )
+                    count += 1
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    return _retry_on_lock(_write)
 
 
 def get_prediction_audit(days: int = 14, db_path: Optional[Path] = None) -> pd.DataFrame:

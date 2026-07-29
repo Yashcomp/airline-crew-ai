@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from data.crew_loader import load_crew
 from data.flights_db import (
     assign_crew_to_flight, get_crew_for_flight, get_flights_for_crew,
-    is_crew_assigned, get_standby_crew, get_flight,
+    is_crew_assigned, get_standby_crew, get_flight, get_all_assignments,
 )
 from data.models import CrewMember, Flight, Role
 from validators.dgca_validator import check_crew_eligibility, GROUND_ROLES
@@ -48,18 +48,23 @@ def auto_assign_flight(
     crew = load_crew(csv_path)
     already_assigned = get_crew_for_flight(flight_id, db_path)
     assigned_ids = {a["crew_id"] for a in already_assigned}
+    role_counts = {}
+    for a in already_assigned:
+        role_counts[a["role"]] = role_counts.get(a["role"], 0) + 1
+
+    all_assigned_ids = set(a["crew_id"] for a in get_all_assignments(db_path))
 
     new_assignments = []
     errors = []
 
     for role_name, count in REQUIRED_CREW.items():
-        needed = count
+        needed = count - role_counts.get(role_name, 0)
         for member in crew:
             if needed <= 0:
                 break
             if member.crew_id in assigned_ids:
                 continue
-            if is_crew_assigned(member.crew_id, db_path):
+            if member.crew_id in all_assigned_ids:
                 continue
             if member.rest_status.lower() != "legal":
                 continue

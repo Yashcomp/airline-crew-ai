@@ -11,8 +11,9 @@ def get_revenue_by_flight(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         rows = conn.execute("""
             SELECT flight_id, COUNT(*) as transactions,
@@ -46,8 +47,9 @@ def get_revenue_by_gate(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         rows = conn.execute("""
             SELECT terminal, location, COUNT(*) as transactions,
@@ -75,8 +77,9 @@ def get_passenger_spend_profile(db_path: Optional[Path] = None) -> Dict[str, Any
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         class_rows = conn.execute("""
             SELECT p.seat_class, COUNT(r.txn_id) as transactions,
@@ -138,7 +141,8 @@ def predict_retail_demand(db_path: Optional[Path] = None, flight_id: Optional[st
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         avg_txn_per_pax = conn.execute("""
             SELECT COUNT(DISTINCT r.txn_id) * 1.0 / COUNT(DISTINCT p.passenger_id)

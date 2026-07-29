@@ -11,8 +11,9 @@ def get_passenger_profile(db_path: Optional[Path] = None, flight_id: Optional[st
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         if flight_id:
             rows = conn.execute(
@@ -62,8 +63,9 @@ def get_baggage_load_profile(db_path: Optional[Path] = None, flight_id: Optional
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         if flight_id:
             rows = conn.execute(
@@ -105,8 +107,9 @@ def get_demand_by_route(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         route_rows = conn.execute("""
             SELECT f.flight_id, f.origin, f.destination, f.route_type,
@@ -149,7 +152,8 @@ def predict_baggage_load(db_path: Optional[Path] = None, flight_id: Optional[str
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         if flight_id:
             pax = conn.execute(
@@ -189,8 +193,9 @@ def get_connecting_pax_analysis(db_path: Optional[Path] = None) -> Dict[str, Any
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         total = conn.execute("SELECT COUNT(*) FROM ops_passengers").fetchone()[0]
         connecting = conn.execute(

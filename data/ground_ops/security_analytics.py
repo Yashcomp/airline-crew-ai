@@ -11,8 +11,9 @@ def get_security_throughput(db_path: Optional[Path] = None) -> Dict[str, Any]:
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         total = conn.execute("SELECT COUNT(*) FROM ops_security").fetchone()[0]
         if total == 0:
@@ -57,8 +58,9 @@ def get_screening_staff_performance(db_path: Optional[Path] = None) -> Dict[str,
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         rows = conn.execute("""
             SELECT s.staff_id, st.name, st.role,
@@ -95,8 +97,9 @@ def predict_queue_buildup(db_path: Optional[Path] = None, departure_window_hours
     path = db_path or DEFAULT_DB
     if not path.exists():
         return {"loaded": False}
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
         flight_rows = conn.execute("""
             SELECT CAST(strftime('%H', std) AS INTEGER) as hour,
