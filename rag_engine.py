@@ -16,7 +16,6 @@ CHUNK_OVERLAP = 200
 DEFAULT_TOP_K = 6
 RETRIEVAL_THRESHOLD = 0.9
 AZURE_API_VERSION_DEFAULT = "2024-02-15-preview"
-_EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 RULE_KEYWORDS = ("regulation", "dgca", "fdtl", "rule", "clause", "legal", "compliance", "reporting time", "report time", "reporting", "duty time", "duty period", "rest requirement", "minimum rest", "flying hour", "flight time limit")
 SOP_KEYWORDS = ("sop", "procedure", "protocol", "standard operating", "guideline", "report for duty", "sign on", "sign-on", "duty start", "check in time")
@@ -351,43 +350,6 @@ def _build_llm():
         return DummyLLM(), "dummy"
 
 
-def _get_sentence_transformer():
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer(_EMBEDDING_MODEL_NAME)
-    except ImportError:
-        return None
-
-
-_sentence_transformer_instance = None
-
-def _get_sentence_transformer_cached():
-    global _sentence_transformer_instance
-    if _sentence_transformer_instance is None:
-        _sentence_transformer_instance = _get_sentence_transformer()
-    return _sentence_transformer_instance
-
-
-def _semantic_search(query: str, documents: list, top_k: int = 6) -> list:
-    model = _get_sentence_transformer_cached()
-    if model is None or not documents:
-        return documents[:top_k]
-
-    doc_texts = [getattr(d, "page_content", "") or "" for d in documents]
-    doc_texts_clean = [t if t.strip() else "empty" for t in doc_texts]
-
-    query_embedding = model.encode([query], convert_to_tensor=True)
-    doc_embeddings = model.encode(doc_texts_clean, convert_to_tensor=True)
-
-    from sentence_transformers import util
-    scores = util.cos_sim(query_embedding, doc_embeddings)[0]
-
-    scored_docs = [(float(scores[i]), i, documents[i]) for i in range(len(documents))]
-    scored_docs.sort(key=lambda x: (-x[0], x[1]))
-
-    return [doc for _, _, doc in scored_docs[:top_k]]
-
-
 def load_documents(pdf_sources: Optional[List[Path]] = None) -> list:
     pdf_loader_cls = _import_pdf_loader()
     directory_loader_cls = _import_document_loader()
@@ -631,10 +593,7 @@ def retrieve_legal_guidance(
     if not documents:
         return DummyLLM().synthesize(query, "")
 
-    relevant_docs = _semantic_search(query, documents, top_k)
-
-    if not relevant_docs:
-        relevant_docs = _rank_documents(query, documents)[:top_k]
+    relevant_docs = _rank_documents(query, documents)[:top_k]
 
     if not relevant_docs:
         vectorstore = build_vectorstore(pdf_folder)
