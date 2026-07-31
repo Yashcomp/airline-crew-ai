@@ -936,7 +936,7 @@ with tab_ops:
         st.success(sync_result["message"])
         st.rerun()
 
-    flights = get_flights(date=datetime.combine(datetime.now().date(), datetime.min.time()), db_path=DEFAULT_DB_PATH)
+    flights = get_flights(db_path=DEFAULT_DB_PATH)
     crew = load_crew(DEFAULT_CSV_PATH)
 
     if not flights:
@@ -1129,7 +1129,12 @@ with tab_forecast:
         recs = crew_plan.get("crew_recommendations", {})
         crew_name_df = pd.read_csv(DEFAULT_CSV_PATH)
         crew_name_map = dict(zip(crew_name_df["crew_id"], crew_name_df["name"]))
-        for f in today_flights:
+        risk_order = {"High": 0, "Medium": 1}
+        high_med_flights = sorted(
+            [f for f in today_flights if f["prediction"]["risk_level"] in ("High", "Medium")],
+            key=lambda x: (risk_order.get(x["prediction"]["risk_level"], 2), -x["prediction"]["delay_probability"]),
+        )
+        for f in high_med_flights:
                 pred = f["prediction"]
                 risk_color = "red" if pred["risk_level"] == "High" else ("orange" if pred["risk_level"] == "Medium" else "gray")
                 wx = f.get("weather", {})
