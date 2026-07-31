@@ -1024,7 +1024,7 @@ with tab_forecast:
     st.caption("Predict delays and suggest DGCA-compliant crew assignments using OpenSky data and ML models.")
 
     st.subheader("Daily Briefing — BLR Flights")
-    st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments.")
+    st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments. Today's predictions weight this weekday's delay history from previous weeks (recency-decayed).")
 
     from data.opensky_db import get_flight_stats as get_opensky_stats
     _os_stats = get_opensky_stats(DEFAULT_DB_PATH)
@@ -1104,6 +1104,7 @@ with tab_forecast:
     today_flights = st.session_state.get("today_flights", [])
     crew_plan = st.session_state.get("crew_plan", {})
     at_risk = st.session_state.get("at_risk_crew", {})
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
     if today_flights:
         high = [f for f in today_flights if f["prediction"]["risk_level"] == "High"]
@@ -1146,6 +1147,7 @@ with tab_forecast:
 
                 with st.container():
                     leg_badge = ":blue[First Leg]" if leg_type == "First Leg" else ":green[Return Leg]"
+                    _dow_name = day_names[datetime.now().weekday()]
                     st.markdown(
                         f"**{fid}** | {f['scheduled_departure']} | "
                         f"**{f['route']}** | {f['avg_duration_min']}min | "
@@ -1163,7 +1165,8 @@ with tab_forecast:
 
                     col_wx, col_hist = st.columns(2)
                     col_wx.caption(f"Weather: {wx.get('temp_c', '?')}C, Wind {wx.get('wind_kmh', '?')}km/h, Precip {wx.get('precipitation_mm', 0)}mm")
-                    col_hist.caption(f"History: {f['delay_rate_pct']}% delay rate, avg deviation {f['avg_deviation_min']}min across {f['total_flights']} flights")
+                    _hist_count = f.get("dow_sample_count") or f["total_flights"]
+                    col_hist.caption(f"Weekday history ({_dow_name}): {f['delay_rate_pct']}% delayed, avg deviation {f['avg_deviation_min']}min across {_hist_count} {_dow_name}s")
 
                     if suggestions:
                         replacement_lines = []
@@ -1518,7 +1521,7 @@ with tab_planning:
             c4.metric("Low Risk", len(low))
 
             day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            st.caption(f"Day of week: **{day_names[selected_date.weekday()]}** — predictions based on historical delay patterns for this day")
+            st.caption(f"Day of week: **{day_names[selected_date.weekday()]}** — predictions weight this day's delay history from previous weeks (recency-decayed, newer weeks count more)")
 
             if high or med:
                 st.divider()
@@ -1687,7 +1690,7 @@ with tab_planning:
                     "Risk": pred["risk_level"],
                     "Delay Prob": f"{pred['delay_probability']*100:.0f}%",
                     "Expected Delay": f"{pred['expected_delay_min']:.0f}min",
-                    "History": f"{f['delay_rate_pct']}% delayed ({f['total_flights']} flights)",
+                "History": f"{f['delay_rate_pct']}% on {day_names[datetime.now().weekday()]}s ({f.get('dow_sample_count') or f['total_flights']} flights)",
                 })
             st.dataframe(pd.DataFrame(all_data), use_container_width=True, hide_index=True)
         else:

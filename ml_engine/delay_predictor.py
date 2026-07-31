@@ -24,6 +24,9 @@ _MODEL_METADATA_PATH = _MODELS_DIR / "model_metadata.pkl"
 
 _DELAY_THRESHOLD_MIN = 15.0
 
+WEEKDAY_WEIGHT_DEFAULT = 0.75
+_WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE = 8
+
 _WEATHER_BASELINE = {
     "wind_kmh": 21.0,
     "precip_mm": 0.1,
@@ -437,6 +440,8 @@ def predict_delay(
     delay_rate_pct: Optional[float] = None,
     dow_delay_rate: Optional[float] = None,
     overall_delay_rate: Optional[float] = None,
+    weekday_weight: float = WEEKDAY_WEIGHT_DEFAULT,
+    dow_sample_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     if departure_time is None:
         departure_time = datetime.now()
@@ -484,14 +489,18 @@ def predict_delay(
     result["expected_delay_min"] = round(result["expected_delay_min"] + weather_adj["delay_boost"], 1)
 
     _GLOBAL_BASELINE_DELAY_RATE = 0.02
-    if dow_delay_rate is not None and overall_delay_rate is not None and overall_delay_rate > 0 and dow_delay_rate > 0:
+    if dow_delay_rate is not None and overall_delay_rate is not None and overall_delay_rate > 0:
         base_prob = result["delay_probability"]
         scale_factor = dow_delay_rate / max(overall_delay_rate, _GLOBAL_BASELINE_DELAY_RATE)
         scale_factor = max(0.3, min(3.0, scale_factor))
-        adjusted_prob = base_prob * scale_factor
+        confidence = 1.0
+        if dow_sample_count is not None:
+            confidence = min(1.0, dow_sample_count / _WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE)
+        pull = 1.0 + (scale_factor - 1.0) * weekday_weight * confidence
+        adjusted_prob = base_prob * pull
         adjusted_prob = max(0.05, min(0.95, adjusted_prob))
         result["delay_probability"] = round(adjusted_prob, 3)
-        result["expected_delay_min"] = round(result["expected_delay_min"] * scale_factor, 1)
+        result["expected_delay_min"] = round(result["expected_delay_min"] * pull, 1)
 
     prob = result["delay_probability"]
     exp_delay = result["expected_delay_min"]
@@ -532,21 +541,22 @@ def predict_delay(
     if dow_delay_rate is not None and overall_delay_rate is not None and overall_delay_rate > 0:
         dow_pct = dow_delay_rate * 100
         overall_pct = overall_delay_rate * 100
+        has_weekday_data = dow_sample_count is None or dow_sample_count > 0
         if departure_time is not None:
             day_name = day_names[departure_time.weekday()]
         else:
             day_name = "this day"
         if dow_pct > overall_pct * 1.2:
             factors.append(
-                f"Historically {dow_pct:.0f}% delay rate on {day_name} vs {overall_pct:.0f}% overall"
+                f"Recent-week history: {dow_pct:.0f}% delay rate on {day_name}s (previous weeks) vs {overall_pct:.0f}% overall — weekday pattern weighted in"
             )
         elif dow_pct < overall_pct * 0.8 and dow_pct > 0:
             factors.append(
-                f"Lower historical delay rate on {day_name} ({dow_pct:.0f}% vs {overall_pct:.0f}% overall)"
+                f"Lower recent-week delay rate on {day_name}s ({dow_pct:.0f}% vs {overall_pct:.0f}% overall) — weekday pattern weighted in"
             )
-        elif dow_pct == 0 and overall_pct > 5:
+        elif dow_pct == 0 and overall_pct > 5 and has_weekday_data:
             factors.append(
-                f"No historical delays on {day_name} for this route (vs {overall_pct:.0f}% overall)"
+                f"No recent delays on {day_name}s for this route (vs {overall_pct:.0f}% overall)"
             )
 
     result.update({
