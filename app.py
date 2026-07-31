@@ -72,10 +72,10 @@ if "system_initialized" not in st.session_state:
 def _build_chat_context() -> str:
     lines = []
     try:
-        from data.opensky_db import get_flight_schedule
-        schedule = get_flight_schedule(limit=20, db_path=DEFAULT_DB_PATH)
+        from data.opensky_db import get_flight_schedule, SCHEDULE_LIMIT
+        schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=DEFAULT_DB_PATH)
         if schedule:
-            lines.append("TODAY'S BLR FLIGHTS (20):")
+            lines.append("TODAY'S BLR FLIGHTS (%d):" % len(schedule))
             for f in schedule:
                 lines.append(
                     "  %s %s->%s dep %02d:%02d %dmin delay_rate=%d%%" % (

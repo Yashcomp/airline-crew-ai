@@ -21,6 +21,10 @@ from data.weather_client import (
 DEFAULT_DB_PATH = Path(__file__).parent / "flights.db"
 _CALLSIGN_MAP_PATH = Path(__file__).parent / "callsign_map.csv"
 
+SCHEDULE_LIMIT = 20
+DELAY_RESERVED_SLOTS = 10
+MIN_DELAY_SAMPLES = 5
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=5)
@@ -826,7 +830,7 @@ def get_flight_schedule(
                        total_flights, days_active,
                        avg_departure_hour, avg_duration_min,
                        delayed_w, weighted_count, dow_sample_count,
-                       wdev_sum, max_deviation
+                       delayed_count, wdev_sum, max_deviation
                 FROM (
                     SELECT
                         f.callsign,
@@ -841,6 +845,7 @@ def get_flight_schedule(
                         SUM(CASE WHEN dl.is_delayed = 1 THEN w ELSE 0 END) as delayed_w,
                         SUM(w) as weighted_count,
                         COUNT(dl.flight_id) as dow_sample_count,
+                        SUM(CASE WHEN dl.is_delayed = 1 THEN 1 ELSE 0 END) as delayed_count,
                         SUM(ABS(COALESCE(dl.deviation_min, 0)) * w) as wdev_sum,
                         ROUND(MAX(ABS(COALESCE(dl.deviation_min, 0))), 1) as max_deviation
                     FROM opensky_flights f
@@ -865,8 +870,7 @@ def get_flight_schedule(
                     HAVING total_flights >= 2
                 )
                 ORDER BY total_flights DESC, days_active DESC
-                LIMIT ?
-            """, (day_of_week, ref, limit)).fetchall()
+            """, (day_of_week, ref)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT
@@ -895,12 +899,41 @@ def get_flight_schedule(
                 GROUP BY f.callsign, f.origin_airport, f.destination_airport
                 HAVING total_flights >= 2
                 ORDER BY total_flights DESC, days_active DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
+            """).fetchall()
     except sqlite3.OperationalError:
         rows = []
     finally:
         conn.close()
+
+    delay_slots = min(DELAY_RESERVED_SLOTS, limit)
+    if rows and delay_slots > 0:
+        def _rank_key(r, by_delay):
+            if by_delay:
+                return (r["delayed_count"] or 0, r["total_flights"] or 0, r["days_active"] or 0, r["callsign"])
+            return (r["total_flights"] or 0, r["days_active"] or 0, r["callsign"])
+
+        delayed_sorted = sorted(rows, key=lambda r: _rank_key(r, True), reverse=True)
+        volume_sorted = sorted(rows, key=lambda r: _rank_key(r, False), reverse=True)
+
+        chosen = []
+        seen = set()
+        picked = 0
+        for r in delayed_sorted:
+            if picked >= delay_slots:
+                break
+            key = (r["callsign"], r["origin_airport"], r["destination_airport"])
+            if (r["delayed_count"] or 0) > 0 and (r["total_flights"] or 0) >= MIN_DELAY_SAMPLES and key not in seen:
+                seen.add(key)
+                chosen.append(r)
+                picked += 1
+        for r in volume_sorted:
+            if len(chosen) >= limit:
+                break
+            key = (r["callsign"], r["origin_airport"], r["destination_airport"])
+            if key not in seen:
+                seen.add(key)
+                chosen.append(r)
+        rows = chosen
 
     overall_stats: Dict[str, Dict[str, Any]] = {}
     if day_of_week is not None:
@@ -1007,7 +1040,7 @@ def get_flight_schedule(
 def get_model_flights_with_status(
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
-    schedule = get_flight_schedule(limit=20, db_path=db_path)
+    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=db_path)
     path = db_path or DEFAULT_DB_PATH
     if not path.exists():
         return schedule
@@ -1280,7 +1313,7 @@ def get_today_schedule(
 
     path = db_path or DEFAULT_DB_PATH
     today = datetime.now(timezone.utc)
-    schedule = get_flight_schedule(limit=20, db_path=path, day_of_week=today.weekday())
+    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=path, day_of_week=today.weekday())
 
     _load_models()
 
@@ -1399,7 +1432,7 @@ def get_schedule_for_date(
         target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
     dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
     schedule = get_flight_schedule(
-        limit=20, db_path=db_path, day_of_week=dt.weekday(),
+        limit=SCHEDULE_LIMIT, db_path=db_path, day_of_week=dt.weekday(),
         reference_date=dt.strftime("%Y-%m-%d"),
     )
 
@@ -1687,18 +1720,29 @@ def sync_opensky_flights_to_db(
     csv_path: Optional[str] = None,
     db_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    from data.flights_db import insert_flight, get_flight, get_crew_for_flight
+    from data.flights_db import insert_flight, get_flight, get_crew_for_flight, get_flights
+    from data.flights_db import unassign_crew_from_flight, delete_flight
     from data.models import Flight, FlightStatus
     from data.staff_manager import auto_assign_flight, REQUIRED_CREW
 
     path = db_path or DEFAULT_DB_PATH
     today = datetime.now()
-    schedule = get_flight_schedule(limit=20, db_path=path)
+    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=path)
     if not schedule:
         return {"inserted": 0, "assigned": 0, "message": "No flights in schedule."}
 
     if csv_path is None:
         csv_path = str(Path(__file__).parent.parent / "crew_standby_list.csv")
+
+    reconciled = 0
+    schedule_ids = {f["callsign"] for f in schedule}
+    for existing in get_flights(db_path=path):
+        if existing.flight_id in schedule_ids:
+            continue
+        for crew in get_crew_for_flight(existing.flight_id, path):
+            unassign_crew_from_flight(crew["crew_id"], existing.flight_id, path)
+        delete_flight(existing.flight_id, path)
+        reconciled += 1
 
     inserted = 0
     assigned = 0
@@ -1750,8 +1794,9 @@ def sync_opensky_flights_to_db(
         "filled": filled,
         "skipped": skipped,
         "assigned": assigned,
+        "reconciled": reconciled,
         "total": len(schedule),
-        "message": f"Inserted {inserted} flights, assigned crew to {assigned}, backfilled {filled} existing flights, skipped {skipped} (already full).",
+        "message": f"Inserted {inserted} flights, assigned crew to {assigned}, backfilled {filled} existing flights, skipped {skipped} (already full), removed {reconciled} stale flights.",
     }
 
 
