@@ -1195,7 +1195,16 @@ with tab_forecast:
                             already_assigned_count = 0
                             failed_count = 0
                             reassigned_count = 0
+                            replaced_count = 0
                             for role_name, sug in suggestions.items():
+                                old_cid = sug.get("old_crew_id")
+                                if old_cid:
+                                    unassign_crew_from_flight(old_cid, fid, DEFAULT_DB_PATH)
+                                    replaced_count += 1
+                                role_count = sum(1 for a in get_crew_for_flight(fid, DEFAULT_DB_PATH) if a["role"] == role_name)
+                                if role_count >= REQUIRED_CREW.get(role_name, 0):
+                                    already_assigned_count += 1
+                                    continue
                                 old_flight = sug.get("assigned_flight", "")
                                 if old_flight:
                                     unassign_crew_from_flight(sug["crew_id"], old_flight, DEFAULT_DB_PATH)
@@ -1212,8 +1221,13 @@ with tab_forecast:
                                 for line in replacement_lines:
                                     msg_lines.append(f"• {line}")
                                 msg = "\n".join(msg_lines)
+                                extra = []
+                                if replaced_count:
+                                    extra.append(f"{replaced_count} old crew removed from {fid}")
                                 if reassigned_count:
-                                    msg += f"\n\n({reassigned_count} reassigned from other flights)"
+                                    extra.append(f"{reassigned_count} reassigned from other flights")
+                                if extra:
+                                    msg += "\n\n(" + ", ".join(extra) + ")"
                                 st.success(msg)
                                 st.session_state["crew_plan"] = proactive_crew_assignment(
                                     today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH
