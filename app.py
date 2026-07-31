@@ -29,6 +29,7 @@ from data.opensky_db import (
     get_model_flights_with_status, sync_opensky_flights_to_db,
     log_predictions, backfill_predictions, update_actuals,
     get_prediction_audit, compute_audit_metrics,
+    get_flight_actuals_for_date, get_data_date_range,
 )
 from data.staff_manager import REQUIRED_CREW
 from validators.dgca_validator import GROUND_ROLES, check_crew_eligibility
@@ -1488,10 +1489,20 @@ with tab_planning:
     today = date_type.today()
     max_date = today + timedelta(days=16)
 
+    data_lo, data_hi = get_data_date_range(DEFAULT_DB_PATH)
+    min_date = today
+    if data_lo:
+        try:
+            data_start = date_type.fromisoformat(data_lo)
+            if data_start < min_date:
+                min_date = data_start
+        except ValueError:
+            pass
+
     selected_date = st.date_input(
         "Select a date to plan for",
         value=today,
-        min_value=today,
+        min_value=min_date,
         max_value=max_date,
     )
 
@@ -1499,6 +1510,8 @@ with tab_planning:
         days_ahead = (selected_date - today).days
         if days_ahead == 0:
             st.info("This is today. Use the **Forecasting** tab for the full Daily Briefing with crew assignment.")
+        elif days_ahead < 0:
+            st.caption(f"Past date — showing predictions and **what actually happened** on {selected_date}.")
         else:
             st.caption(f"Planning {days_ahead} day(s) ahead — weather forecast available via Open-Meteo.")
 
@@ -1693,5 +1706,67 @@ with tab_planning:
                 "History": f"{f['delay_rate_pct']}% on {day_names[datetime.now().weekday()]}s ({f.get('dow_sample_count') or f['total_flights']} flights)",
                 })
             st.dataframe(pd.DataFrame(all_data), use_container_width=True, hide_index=True)
+
+            show_actuals = False
+            if data_hi:
+                try:
+                    show_actuals = selected_date <= date_type.fromisoformat(data_hi)
+                except ValueError:
+                    pass
+
+            if show_actuals:
+                with st.spinner(f"Loading actuals for {selected_date}..."):
+                    actuals = get_flight_actuals_for_date(selected_date, db_path=DEFAULT_DB_PATH)
+
+                st.divider()
+                st.subheader(f"What Actually Happened — {selected_date}")
+                st.caption("Times are UTC. Scheduled = typical recurring departure (as shown across the app); Actual = ADS-B first/last seen (includes taxi-out, so small gaps are normal). "
+                           "Delayed = duration deviation beyond threshold, matching the rest of the app.")
+
+                if actuals:
+                    with_actual = [a for a in actuals if a["has_actual"]]
+                    delayed_rows = [a for a in with_actual if a["status"] == "Delayed"]
+                    pred_high = [a for a in with_actual if a.get("predicted_risk") == "High"]
+                    pred_med = [a for a in with_actual if a.get("predicted_risk") == "Medium"]
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Flights Operated", len(with_actual))
+                    m2.metric("Delayed", len(delayed_rows), delta=f"{len(delayed_rows)/len(with_actual)*100:.0f}%" if with_actual else "0%",
+                              delta_color="inverse" if delayed_rows else "off")
+                    m3.metric("Model High Risk", len(pred_high), delta_color="inverse" if pred_high else "off")
+                    m4.metric("Model Medium Risk", len(pred_med), delta_color="inverse" if pred_med else "off")
+
+                    actual_rows = []
+                    for a in actuals:
+                        row = {
+                            "Flight": a["callsign"],
+                            "Route": a["route"],
+                            "Scheduled Dep": a["scheduled_dep"] or "-",
+                            "Actual Dep": a["actual_dep"] or "-",
+                            "Actual Arr": a["actual_arr"] or "-",
+                            "Expected Time": f"{a['expected_flight_min']:.0f}min" if a["expected_flight_min"] is not None else "-",
+                            "Actual Time": f"{a['actual_flight_min']:.0f}min" if a["actual_flight_min"] is not None else "-",
+                            "Deviation": f"{a['deviation_min']:+.1f}min" if a["deviation_min"] is not None else "-",
+                            "Status": a["status"],
+                        }
+                        if a.get("predicted_prob") is not None:
+                            row["Predicted Prob"] = f"{a['predicted_prob']*100:.0f}%"
+                            row["Predicted Delay"] = f"{a['predicted_delay_min']:.0f}min" if a["predicted_delay_min"] is not None else "-"
+                            row["Actual Delay"] = f"{a['actual_delay_min']:+.1f}min" if a["actual_delay_min"] is not None else "-"
+                        actual_rows.append(row)
+
+                    actual_df = pd.DataFrame(actual_rows)
+                    styled = actual_df.style.map(
+                        lambda v: "color: #d63031; font-weight: bold" if v == "Delayed"
+                        else "color: #00b894; font-weight: bold" if v == "On time"
+                        else "",
+                        subset=["Status"],
+                    )
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                    if not with_actual:
+                        st.info("No ADS-B/label data found for the scheduled flights on this date.")
+                else:
+                    st.info("No flight data for this date.")
         else:
             st.warning("No flights found for this date.")

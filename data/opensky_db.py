@@ -1493,6 +1493,163 @@ def get_schedule_for_date(
     return schedule
 
 
+def get_data_date_range(
+    db_path: Optional[Path] = None,
+) -> Tuple[str, str]:
+    """Return (min_date, max_date) for which flight data exists, as YYYY-MM-DD strings."""
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return ("", "")
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT MIN(date) as lo, MAX(date) as hi FROM opensky_flights WHERE date IS NOT NULL"
+        ).fetchone()
+        return (row["lo"] or "", row["hi"] or "")
+    except sqlite3.OperationalError:
+        return ("", "")
+    finally:
+        conn.close()
+
+
+def get_flight_actuals_for_date(
+    target_date,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Expected vs actual times for the scheduled flights on a given date.
+
+    Frame is the recurring schedule (flights table). Scheduled/expected departure
+    uses the flight's typical departure time (same avg used across the app).
+    Actual clock times come from opensky_flights (ADS-B first/last seen),
+    expected/actual duration and delay status from delay_labels, and
+    prediction-vs-outcome where the model logged a prediction for that date.
+    """
+    if isinstance(target_date, str):
+        target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+    date_str = target_date.strftime("%Y-%m-%d")
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return []
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                fl.flight_id AS callsign,
+                fl.origin,
+                fl.destination,
+                fl.aircraft_type,
+                fl.flight_duration_min,
+                ROUND(AVG(
+                    CAST((CAST(fh.first_seen AS INTEGER) % 86400) / 3600.0 AS REAL)
+                ), 1) AS avg_departure_hour,
+                osf.first_seen,
+                osf.last_seen,
+                dl.expected_duration_min,
+                dl.actual_duration_min,
+                dl.deviation_min,
+                dl.is_delayed,
+                pl.delay_probability,
+                pl.expected_delay_min AS predicted_delay_min,
+                pl.risk_level AS predicted_risk,
+                pl.actual_delay_min,
+                pl.actual_is_delayed
+            FROM flights fl
+            LEFT JOIN opensky_flights fh
+              ON fh.callsign = fl.flight_id
+             AND fh.origin_airport = fl.origin
+             AND fh.destination_airport = fl.destination
+            LEFT JOIN (
+                SELECT callsign, origin_airport, destination_airport, date,
+                       MIN(first_seen) AS first_seen, MIN(last_seen) AS last_seen
+                FROM opensky_flights
+                WHERE date = ?
+                GROUP BY callsign, origin_airport, destination_airport
+            ) osf
+              ON osf.callsign = fl.flight_id
+             AND osf.origin_airport = fl.origin
+             AND osf.destination_airport = fl.destination
+            LEFT JOIN delay_labels dl
+              ON dl.flight_id = fl.flight_id
+             AND dl.origin = fl.origin
+             AND dl.destination = fl.destination
+             AND dl.date = ?
+            LEFT JOIN prediction_log pl
+              ON pl.callsign = fl.flight_id
+             AND pl.origin = fl.origin
+             AND pl.destination = fl.destination
+             AND pl.date = ?
+             AND pl.id = (
+                 SELECT MAX(id) FROM prediction_log pl2
+                 WHERE pl2.callsign = fl.flight_id
+                   AND pl2.origin = fl.origin
+                   AND pl2.destination = fl.destination
+                   AND pl2.date = ?
+             )
+            GROUP BY fl.flight_id, fl.origin, fl.destination, fl.aircraft_type,
+                     fl.flight_duration_min, osf.first_seen, osf.last_seen,
+                     dl.expected_duration_min, dl.actual_duration_min,
+                     dl.deviation_min, dl.is_delayed,
+                     pl.delay_probability, pl.expected_delay_min, pl.risk_level,
+                     pl.actual_delay_min, pl.actual_is_delayed
+            ORDER BY fl.std
+            """,
+            (date_str, date_str, date_str, date_str),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+
+    actuals = []
+    for r in rows:
+        scheduled_dep = None
+        scheduled_arr = None
+        hour = r["avg_departure_hour"]
+        if hour is not None:
+            hour_int = int(hour)
+            minute = int((hour - hour_int) * 60)
+            scheduled_dep = f"{hour_int:02d}:{minute:02d}"
+            expected_min = r["expected_duration_min"]
+            if expected_min is None:
+                expected_min = r["flight_duration_min"] or 0
+            dep_dt = datetime.now(timezone.utc).replace(hour=hour_int, minute=minute, second=0, microsecond=0)
+            scheduled_arr = (dep_dt + timedelta(minutes=expected_min)).strftime("%H:%M")
+        actual_dep = None
+        actual_arr = None
+        if r["first_seen"] is not None:
+            actual_dep = datetime.fromtimestamp(r["first_seen"], timezone.utc).strftime("%H:%M")
+        if r["last_seen"] is not None:
+            actual_arr = datetime.fromtimestamp(r["last_seen"], timezone.utc).strftime("%H:%M")
+        has_actual = r["first_seen"] is not None and r["expected_duration_min"] is not None
+        if r["is_delayed"] is not None:
+            status = "Delayed" if r["is_delayed"] else "On time"
+        elif not has_actual:
+            status = "No data"
+        else:
+            status = "On time"
+        actuals.append({
+            "callsign": r["callsign"],
+            "route": f"{r['origin']}→{r['destination']}",
+            "aircraft_type": r["aircraft_type"],
+            "scheduled_dep": scheduled_dep,
+            "scheduled_arr": scheduled_arr,
+            "actual_dep": actual_dep,
+            "actual_arr": actual_arr,
+            "expected_flight_min": r["expected_duration_min"],
+            "actual_flight_min": r["actual_duration_min"],
+            "deviation_min": round(r["deviation_min"], 1) if r["deviation_min"] is not None else None,
+            "status": status,
+            "has_actual": has_actual,
+            "predicted_prob": r["delay_probability"],
+            "predicted_delay_min": r["predicted_delay_min"],
+            "predicted_risk": r["predicted_risk"],
+            "actual_delay_min": r["actual_delay_min"],
+            "actual_is_delayed": r["actual_is_delayed"],
+        })
+    return actuals
+
+
 def update_daily_data(
     days_back: int = 1,
     db_path: Optional[Path] = None,
