@@ -4,7 +4,7 @@ import csv
 import json
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1558,6 +1558,72 @@ def get_data_date_range(
         return (row["lo"] or "", row["hi"] or "")
     except sqlite3.OperationalError:
         return ("", "")
+    finally:
+        conn.close()
+
+
+def get_delayed_flights_for_date(
+    target_date,
+    db_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return flights actually delayed on a given date, from delay_labels.
+
+    Returns a dict like
+    {"date": "YYYY-MM-DD", "total": N, "delayed": M,
+     "flights": [{"flight_id", "origin", "destination", "departure",
+                  "actual_duration_min", "expected_duration_min", "deviation_min"}]}
+    sorted by deviation (largest first). `total` is 0 when the date has no
+    recorded flights. Returns None on missing DB or SQL error.
+    """
+    path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    if not path.exists():
+        return None
+    if isinstance(target_date, datetime):
+        dt_str = target_date.strftime("%Y-%m-%d")
+    elif isinstance(target_date, date):
+        dt_str = target_date.strftime("%Y-%m-%d")
+    else:
+        dt_str = str(target_date)
+
+    conn = _connect(path)
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM delay_labels WHERE date = ?", (dt_str,)
+        ).fetchone()[0]
+        if total == 0:
+            return {"date": dt_str, "total": 0, "delayed": 0, "flights": []}
+        rows = conn.execute(
+            """
+            SELECT flight_id, origin, destination, departure_hour,
+                   actual_duration_min, expected_duration_min, deviation_min
+            FROM delay_labels
+            WHERE date = ? AND is_delayed = 1
+            ORDER BY deviation_min DESC
+            """,
+            (dt_str,),
+        ).fetchall()
+        flights = []
+        for r in rows:
+            hour = r["departure_hour"] or 0
+            minutes = int(round((hour - int(hour)) * 60))
+            dep = f"{int(hour):02d}:{minutes:02d}"
+            flights.append({
+                "flight_id": r["flight_id"],
+                "origin": r["origin"],
+                "destination": r["destination"],
+                "departure": dep,
+                "actual_duration_min": r["actual_duration_min"],
+                "expected_duration_min": r["expected_duration_min"],
+                "deviation_min": r["deviation_min"],
+            })
+        return {
+            "date": dt_str,
+            "total": total,
+            "delayed": len(flights),
+            "flights": flights,
+        }
+    except sqlite3.OperationalError:
+        return None
     finally:
         conn.close()
 

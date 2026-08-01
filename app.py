@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from rag_engine import retrieve_legal_guidance
-from router import route_request, _is_plain_greeting
+from router import route_request, _is_plain_greeting, _extract_date
 from solver import solve_from_csv, solve_multi_flight
 from data.flights_db import (
     init_db, get_flights, get_flight,
@@ -31,6 +31,7 @@ from data.opensky_db import (
     log_predictions, update_actuals, get_last_briefing_time,
     get_prediction_audit, compute_audit_metrics,
     get_flight_actuals_for_date, get_data_date_range,
+    get_delayed_flights_for_date,
 )
 from data.staff_manager import REQUIRED_CREW
 from validators.dgca_validator import GROUND_ROLES, check_crew_eligibility
@@ -220,6 +221,69 @@ def _answer_planning_query(user_input: str, extraction: dict = None) -> str:
         % (len(risk_flights), high, med, len(schedule), low)
     )
 
+    return "\n".join(lines)
+
+
+_DELAYED_ON_DATE_PATTERN = re.compile(
+    r"\bdelayed\b.{0,80}\b(?:on|for|in)\s+"
+    r"(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}"
+    r"|\d{4}-\d{2}-\d{2})"
+    r"|\b(?:on|for|in)\s+"
+    r"(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}"
+    r"|\d{4}-\d{2}-\d{2}).{0,80}\bdelayed\b"
+    r"|\bdelayed\s+"
+    r"(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2})",
+    re.IGNORECASE,
+)
+
+
+def _answer_delayed_flights(user_input: str, db_path=None) -> str:
+    if db_path is not None:
+        db_path = Path(db_path)
+    target_date_str = _extract_date(user_input)
+    if not target_date_str:
+        return ""
+    try:
+        target = date.fromisoformat(target_date_str)
+    except Exception:
+        return ""
+    if target > date.today():
+        return ""
+
+    result = get_delayed_flights_for_date(target, db_path=db_path)
+    if result is None:
+        return ""
+
+    day_name = target.strftime("%A, %B %d, %Y")
+    if result["total"] == 0:
+        lo, hi = get_data_date_range(db_path)
+        note = f" (data covers {lo} to {hi})" if lo and hi else ""
+        return f"No flight data recorded for **{day_name}**{note}."
+    if result["delayed"] == 0:
+        return (
+            f"No flights were delayed on **{day_name}** "
+            f"({result['total']} flights on record)."
+        )
+
+    lines = [
+        f"**{result['delayed']}** of **{result['total']}** flights were delayed on **{day_name}**.\n",
+        "| Flight | Route | Departure (UTC) | Actual | Expected | Deviation |",
+        "|--------|-------|-----------------|--------|----------|-----------|",
+    ]
+    cap = 50
+    for f in result["flights"][:cap]:
+        act = f"{f['actual_duration_min']:.0f} min" if f["actual_duration_min"] is not None else "-"
+        exp = f"{f['expected_duration_min']:.0f} min" if f["expected_duration_min"] is not None else "-"
+        dev = f"{f['deviation_min']:+.0f} min" if f["deviation_min"] is not None else "-"
+        lines.append(
+            f"| {f['flight_id']} | {f['origin']} → {f['destination']} "
+            f"| {f['departure']} | {act} | {exp} | {dev} |"
+        )
+    if len(result["flights"]) > cap:
+        lines.append(f"\n_Showing top {cap} of {result['delayed']} delayed flights._")
     return "\n".join(lines)
 
 
@@ -593,6 +657,19 @@ with tab_chat:
                         st.stop()
                     else:
                         st.error(result.get("message", "Could not find replacements."))
+                        st.stop()
+
+                if _DELAYED_ON_DATE_PATTERN.search(prompt):
+                    delayed_text = _answer_delayed_flights(prompt, DEFAULT_DB_PATH)
+                    if delayed_text:
+                        st.markdown("### Delayed Flights")
+                        st.write(delayed_text)
+                        with st.expander("System Extraction & Audit Trail"):
+                            st.json(decision)
+                        st.session_state.messages.append({
+                            "role": "assistant", "type": "flights",
+                            "content": delayed_text, "decision": decision,
+                        })
                         st.stop()
 
                 if intent == "General_Chat":
