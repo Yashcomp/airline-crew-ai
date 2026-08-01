@@ -1847,17 +1847,13 @@ def backfill_predictions(db_path: Optional[Path] = None) -> int:
         dates = conn.execute(
             "SELECT DISTINCT date FROM delay_labels WHERE date IS NOT NULL ORDER BY date"
         ).fetchall()
-        existing = conn.execute(
-            "SELECT DISTINCT date FROM prediction_log"
-        ).fetchall()
-        existing_dates = {r["date"] for r in existing}
     finally:
         conn.close()
 
     total = 0
     for row in dates:
         d = row["date"]
-        if not d or d in existing_dates:
+        if not d:
             continue
         try:
             schedule = get_schedule_for_date(d, db_path=path)
