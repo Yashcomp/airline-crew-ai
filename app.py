@@ -28,7 +28,7 @@ from data.delay_handler import analyze_delay_impact, proactive_crew_assignment
 from data.opensky_db import (
     poll_live_data, get_today_schedule, get_schedule_for_date, update_daily_data,
     get_model_flights_with_status, sync_opensky_flights_to_db,
-    log_predictions, backfill_predictions, update_actuals,
+    log_predictions, update_actuals, get_last_briefing_time,
     get_prediction_audit, compute_audit_metrics,
     get_flight_actuals_for_date, get_data_date_range,
 )
@@ -996,7 +996,7 @@ with tab_chat:
         <script>
         (function () {
             var doc = parent.document;
-            var key = "__airline_chat_count__";
+            var doScroll = __DISCROLL__;
             function chatActive() {
                 var tabs = doc.querySelector('[data-testid="stTabs"]');
                 if (!tabs) return true;
@@ -1012,13 +1012,12 @@ with tab_chat:
             }
             syncBar();
             setTimeout(syncBar, 250);
-            var msgs = doc.querySelectorAll('[data-testid="stChatMessage"]');
-            var count = msgs.length;
-            var prev = parent[key] || 0;
-            if (count > prev && chatActive() && count) {
-                msgs[count - 1].scrollIntoView({ behavior: "smooth", block: "end" });
+            if (doScroll && chatActive()) {
+                var msgs = doc.querySelectorAll('[data-testid="stChatMessage"]');
+                if (msgs.length) {
+                    msgs[msgs.length - 1].scrollIntoView({ behavior: "smooth", block: "end" });
+                }
             }
-            parent[key] = count;
             var tabs = doc.querySelector('[data-testid="stTabs"]');
             if (tabs) {
                 new MutationObserver(syncBar).observe(
@@ -1027,7 +1026,7 @@ with tab_chat:
             }
         })();
         </script>
-        """,
+        """.replace("__DISCROLL__", "true" if prompt else "false"),
         height=0,
     )
 
@@ -1154,67 +1153,53 @@ with tab_forecast:
         else:
             st.info(f"**{_os_stats['total_flights']}** flights stored")
 
-    col_seed, col_brief, col_retrain = st.columns(3)
-    with col_seed:
-        seed_days = st.slider("Days to seed", 1, 60, 30, key="seed_days",
-                              help="Fetch historical flight data from OpenSky. Existing days are skipped automatically.")
-        if st.button(f"Seed {seed_days} days of data", help="Seeds OpenSky data, recomputes delay labels and rotation chains."):
-            with st.spinner(f"Fetching {seed_days} days of flight data..."):
-                update_result = update_daily_data(days_back=seed_days, db_path=DEFAULT_DB_PATH)
-            with st.spinner("Syncing flights and assigning crew..."):
-                sync_result = sync_opensky_flights_to_db(
-                    csv_path=str(DEFAULT_CSV_PATH), db_path=DEFAULT_DB_PATH
+    if st.button("Run Daily Briefing", type="primary",
+                 help="Seeds recent data, auto-trains the model if more than 24h since the last briefing, predicts delays, suggests crew."):
+        with st.spinner("Running Daily Briefing — updating data, predicting delays, assigning crew..."):
+            t0 = time.perf_counter()
+            last_brief = get_last_briefing_time(DEFAULT_DB_PATH)
+            now_brief = datetime.now(timezone.utc)
+            if last_brief is None:
+                days_back = 60
+                retrain = True
+            else:
+                gap_hours = (now_brief - last_brief).total_seconds() / 3600.0
+                if gap_hours > 24:
+                    days_back = min(60, max(1, int(gap_hours // 24) + 1))
+                    retrain = True
+                else:
+                    days_back = 1
+                    retrain = False
+            update_result = update_daily_data(days_back=days_back, db_path=DEFAULT_DB_PATH, retrain=retrain)
+            t1 = time.perf_counter(); print(f"[perf] update_daily_data: {t1-t0:.2f}s")
+            today_flights = get_today_schedule(db_path=DEFAULT_DB_PATH)
+            t2 = time.perf_counter(); print(f"[perf] get_today_schedule: {t2-t1:.2f}s")
+            crew_plan = proactive_crew_assignment(today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
+            t3 = time.perf_counter(); print(f"[perf] proactive_crew_assignment: {t3-t2:.2f}s")
+            at_risk = get_at_risk_crew(str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
+            t4 = time.perf_counter(); print(f"[perf] get_at_risk_crew: {t4-t3:.2f}s")
+            log_predictions(today_flights, DEFAULT_DB_PATH)
+            t5 = time.perf_counter(); print(f"[perf] log_predictions: {t5-t4:.2f}s")
+            update_actuals(DEFAULT_DB_PATH)
+            t6 = time.perf_counter(); print(f"[perf] update_actuals: {t6-t5:.2f}s")
+            print(f"[perf] TOTAL briefing: {t6-t0:.2f}s")
+            model_status = update_result.get("model", {}).get("status", "skipped")
+            if retrain:
+                st.session_state["briefing_status"] = (
+                    f"Auto-trained on {days_back} day(s) of data (model: {model_status})."
                 )
-            with st.spinner("Backfilling predictions for historical data..."):
-                bf_count = backfill_predictions(DEFAULT_DB_PATH)
-                act_count = update_actuals(DEFAULT_DB_PATH)
-            seed_r = update_result["seed"]
-            new_flights = seed_r["total_flights"]
-            skipped = seed_r["days_skipped"]
-            actual = seed_days - skipped
-            st.session_state["system_initialized"] = True
-            st.session_state["flight_count"] = seed_r["total_flights"]
-            st.success(
-                f"**{new_flights}** flights from **{actual}** new days "
-                f"({skipped} days already stored). "
-                f"Labels: {update_result['labels_added']}. "
-                f"{sync_result['message']}. "
-                f"Audit: {bf_count} predictions backfilled, {act_count} actuals updated."
-            )
-            st.rerun()
-    with col_brief:
-        if st.button("Run Daily Briefing", type="primary", help="Seeds yesterday's data, predicts delays, suggests crew."):
-            with st.spinner("Running Daily Briefing — updating data, predicting delays, assigning crew..."):
-                t0 = time.perf_counter()
-                update_result = update_daily_data(days_back=1, db_path=DEFAULT_DB_PATH, retrain=False)
-                t1 = time.perf_counter(); print(f"[perf] update_daily_data: {t1-t0:.2f}s")
-                today_flights = get_today_schedule(db_path=DEFAULT_DB_PATH)
-                t2 = time.perf_counter(); print(f"[perf] get_today_schedule: {t2-t1:.2f}s")
-                crew_plan = proactive_crew_assignment(today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
-                t3 = time.perf_counter(); print(f"[perf] proactive_crew_assignment: {t3-t2:.2f}s")
-                at_risk = get_at_risk_crew(str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
-                t4 = time.perf_counter(); print(f"[perf] get_at_risk_crew: {t4-t3:.2f}s")
-                log_predictions(today_flights, DEFAULT_DB_PATH)
-                t5 = time.perf_counter(); print(f"[perf] log_predictions: {t5-t4:.2f}s")
-                update_actuals(DEFAULT_DB_PATH)
-                t6 = time.perf_counter(); print(f"[perf] update_actuals: {t6-t5:.2f}s")
-                print(f"[perf] TOTAL briefing: {t6-t0:.2f}s")
-            st.session_state["today_flights"] = today_flights
-            st.session_state["crew_plan"] = crew_plan
-            st.session_state["at_risk_crew"] = at_risk
-            st.rerun()
-
-    with col_retrain:
-        if st.button("Retrain Models", help="Retrain XGBoost delay prediction models with latest data."):
-            with st.spinner("Retraining models..."):
-                from ml_engine.delay_predictor import retrain_if_stale
-                r = retrain_if_stale(max_age_hours=0, db_path=DEFAULT_DB_PATH)
-            st.success(f"Models: {r.get('status', 'done')}")
-            st.rerun()
+            else:
+                st.session_state["briefing_status"] = "Model up to date — briefings less than 24h apart."
+        st.session_state["today_flights"] = today_flights
+        st.session_state["crew_plan"] = crew_plan
+        st.session_state["at_risk_crew"] = at_risk
 
     today_flights = st.session_state.get("today_flights", [])
     crew_plan = st.session_state.get("crew_plan", {})
     at_risk = st.session_state.get("at_risk_crew", {})
+    briefing_status = st.session_state.get("briefing_status", "")
+    if briefing_status:
+        st.success(briefing_status)
     day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
     def _date_label(scheduled_date: str) -> str:

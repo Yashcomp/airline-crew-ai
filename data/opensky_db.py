@@ -1857,6 +1857,31 @@ def log_predictions(
     return _retry_on_lock(_write)
 
 
+def get_last_briefing_time(
+    db_path: Optional[Path] = None,
+) -> Optional[datetime]:
+    """Return the most recent briefing time from prediction_log (tz-aware), or None if never briefed."""
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return None
+    try:
+        conn = _connect(path)
+        try:
+            row = conn.execute(
+                "SELECT MAX(predicted_at) AS last FROM prediction_log"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return None
+    if not row or not row["last"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["last"])
+    except (ValueError, TypeError):
+        return None
+
+
 def backfill_predictions(db_path: Optional[Path] = None) -> int:
     path = db_path or DEFAULT_DB_PATH
     init_opensky_tables(db_path)
