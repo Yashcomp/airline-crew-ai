@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from rag_engine import retrieve_legal_guidance
 from router import route_request, _is_plain_greeting
@@ -317,6 +318,20 @@ tab_chat, tab_ops, tab_forecast, tab_live, tab_planning = st.tabs([
     "Chat", "Crew", "Forecasting", "Live Tracking", "Planning",
 ])
 
+st.markdown(
+    """
+    <style>
+    [data-testid='stChatMessage']{scroll-margin-bottom:6.5rem}
+    :root:has([data-testid='stTab'][aria-selected='true']:not([id='0'])) [data-testid='stBottom']{display:none !important}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+prompt = None
+with st.bottom:
+    prompt = st.chat_input("Ask about flights, crew, rules, or disruptions...")
+
 
 # ============================================================
 # TAB 1: CHAT
@@ -396,7 +411,7 @@ with tab_chat:
                     with st.expander("System Extraction & Audit Trail"):
                         st.json(message["decision"])
 
-    if prompt := st.chat_input("Ask about flights, crew, rules, or disruptions..."):
+    if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -976,6 +991,42 @@ with tab_chat:
 
             except Exception as exc:
                 st.error(f"Dispatcher failed: {exc}")
+
+    components.html(
+        """
+        <script>
+        (function () {
+            var doc = parent.document;
+            var key = "__airline_chat_count__";
+            function chatPanelVisible() {
+                var panels = doc.querySelectorAll('[data-testid="stTabPanel"]');
+                if (!panels.length) return true;
+                return panels[0].getClientRects().length > 0;
+            }
+            function syncBar() {
+                var bar = doc.querySelector('[data-testid="stBottom"]');
+                if (!bar) return;
+                bar.style.display = chatPanelVisible() ? "" : "none";
+            }
+            syncBar();
+            var msgs = doc.querySelectorAll('[data-testid="stChatMessage"]');
+            var count = msgs.length;
+            var prev = parent[key] || 0;
+            if (count > prev && chatPanelVisible() && count) {
+                msgs[count - 1].scrollIntoView({ behavior: "smooth", block: "end" });
+            }
+            parent[key] = count;
+            var tabs = doc.querySelector('[data-testid="stTabs"]');
+            if (tabs) {
+                new MutationObserver(syncBar).observe(
+                    tabs, { attributes: true, subtree: true, attributeFilter: ["aria-selected"] }
+                );
+            }
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # ============================================================
