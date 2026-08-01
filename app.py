@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from rag_engine import retrieve_legal_guidance
-from router import route_request
+from router import route_request, _is_plain_greeting
 from solver import solve_from_csv, solve_multi_flight
 from data.flights_db import (
     init_db, get_flights, get_flight,
@@ -227,14 +227,16 @@ def _groq_rag_chat(question: str) -> str:
     from langchain_core.messages import SystemMessage, HumanMessage
     from config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
     from rag_engine import retrieve_legal_guidance
+    from router import _is_plain_greeting
 
     context = _build_chat_context()
 
     dgca_context = ""
-    try:
-        dgca_context = retrieve_legal_guidance(question)
-    except Exception:
-        pass
+    if not _is_plain_greeting(question):
+        try:
+            dgca_context = retrieve_legal_guidance(question)
+        except Exception:
+            pass
 
     llm = ChatOpenAI(
         model=GROQ_MODEL,
@@ -279,6 +281,37 @@ def _groq_rag_chat(question: str) -> str:
         return "Error connecting to AI service: %s" % str(e)
 
 
+def _groq_general_chat(question: str) -> str:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
+
+    llm = ChatOpenAI(
+        model=GROQ_MODEL,
+        api_key=GROQ_API_KEY,
+        base_url=GROQ_BASE_URL,
+        temperature=0.7,
+        request_timeout=15,
+    )
+
+    system_prompt = (
+        "You are a friendly, helpful airline operations assistant for Bangalore (VOBL) airport.\n"
+        "You can chat normally about general topics and greet the user.\n"
+        "If they mention flights, crew, delays, rules, or dates, suggest they ask a specific "
+        "operational question (e.g. a flight number, a crew member, or a date) and you can look it up.\n"
+        "Keep replies concise, warm, and natural."
+    )
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=question),
+        ])
+        return response.content
+    except Exception:
+        return "Hi! I'm your airline ops assistant for VOBL. Ask me about flights, crew, delays, DGCA rules, or predictions and I'll help you out."
+
+
 # === 5 MAIN TABS ===
 tab_chat, tab_ops, tab_forecast, tab_live, tab_planning = st.tabs([
     "Chat", "Crew", "Forecasting", "Live Tracking", "Planning",
@@ -305,6 +338,12 @@ with tab_chat:
 
                 elif msg_type == "data":
                     st.markdown("### Crew Roster Analysis")
+                    st.write(message["content"])
+                    with st.expander("System Extraction & Audit Trail"):
+                        st.json(message["decision"])
+
+                elif msg_type == "chat":
+                    st.markdown("### AI Assistant")
                     st.write(message["content"])
                     with st.expander("System Extraction & Audit Trail"):
                         st.json(message["decision"])
@@ -435,6 +474,12 @@ with tab_chat:
                 decision = route_request(prompt)
                 intent = decision.get("intent", "Data_Query")
 
+                if intent in ("Rule_Query", "Data_Query", "Flight_Status", "Planning_Query") and _is_plain_greeting(prompt):
+                    decision["intent"] = "General_Chat"
+                    decision["route"] = "chat"
+                    decision["extraction"] = {}
+                    intent = "General_Chat"
+
                 delay_override_patterns = [
                     r"del[ao].*?\bby\b",        # "dela by", "delao by"
                     r"del[ao].*?\bfor\b",       # "dela for"
@@ -536,7 +581,18 @@ with tab_chat:
                         st.error(result.get("message", "Could not find replacements."))
                         st.stop()
 
-                if intent == "Rule_Query":
+                if intent == "General_Chat":
+                    result_text = _groq_general_chat(prompt)
+                    st.markdown("### AI Assistant")
+                    st.write(result_text)
+                    with st.expander("System Extraction & Audit Trail"):
+                        st.json(decision)
+                    st.session_state.messages.append({
+                        "role": "assistant", "type": "chat",
+                        "content": result_text, "decision": decision,
+                    })
+
+                elif intent == "Rule_Query":
                     legal_text = retrieve_legal_guidance(prompt)
                     category = decision.get("extraction", {}).get("category")
                     st.markdown("### Rule Analysis")

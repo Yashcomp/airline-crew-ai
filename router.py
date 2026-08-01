@@ -7,6 +7,17 @@ from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
+GREETING_KEYWORDS = (
+    "hi", "hello", "hey", "yo", "hiya", "greetings",
+    "thanks", "thank you", "thx", "ty", "appreciate",
+    "good morning", "good afternoon", "good evening", "good night",
+    "how are you", "how r u", "how do you do", "wassup", "sup",
+    "what can you do", "what do you do", "who are you",
+    "nice to meet", "bye", "goodbye", "see you", "ok bye",
+    "help me", "can you help", "how does this work", "how do i use",
+    "are you a robot", "are you real", "what are you",
+)
+
 RULE_KEYWORDS = (
     "rule", "rules", "dgca", "fdtl", "regulation",
     "clause", "compliance", "legal", "sop", "policy",
@@ -161,7 +172,35 @@ def _extract_required_counts(user_input: str) -> Dict[str, int]:
     return required
 
 
+def _is_plain_greeting(user_input: str) -> bool:
+    if not _contains_any(user_input, GREETING_KEYWORDS):
+        return False
+    if _extract_flight_ids(user_input):
+        return False
+    operational = (
+        RULE_KEYWORDS
+        + VALIDATION_KEYWORDS
+        + DELAY_MANAGEMENT_KEYWORDS
+        + DISRUPTION_KEYWORDS
+        + CREW_QUERY_KEYWORDS
+        + PLANNING_KEYWORDS
+        + FLIGHT_KEYWORDS
+    )
+    if _contains_any(user_input, operational):
+        return False
+    if any(re.search(p, user_input, re.IGNORECASE) for p in DELAY_MANAGEMENT_PATTERNS):
+        return False
+    if any(re.search(p, user_input, re.IGNORECASE) for p in PLANNING_DATE_PATTERNS):
+        return False
+    return True
+
+
 def _classify_with_regex(user_input: str) -> RouteDecision:
+    if _is_plain_greeting(user_input):
+        return RouteDecision(
+            intent="General_Chat", route="chat",
+            confidence=0.9, mode="regex_fallback", raw_input=user_input,
+        )
     if _contains_any(user_input, RULE_KEYWORDS):
         return RouteDecision(
             intent="Rule_Query", route="rag",
@@ -252,7 +291,9 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
     )
     prompt = (
         "You are an airline operations router. Classify the user's intent into ONE of: "
-        "Rule_Query, Data_Query, Flight_Status, Schedule_Disruption, Compliance_Check, Delay_Management, Planning_Query.\n"
+        "Rule_Query, Data_Query, Flight_Status, Schedule_Disruption, Compliance_Check, Delay_Management, Planning_Query, General_Chat.\n"
+        "Use General_Chat for casual greetings and small talk with no operational content "
+        "('hi', 'hello', 'thanks', 'what can you do', 'who are you').\n"
         "If Schedule_Disruption, extract: scenario_flight_hours (float), scenario_is_night_duty (bool), "
         "required_counts (dict), flight_ids (list of strings).\n"
         "If Flight_Status, extract: flight_ids (list), origin (string), destination (string).\n"
@@ -276,6 +317,7 @@ def _classify_with_azure(user_input: str) -> RouteDecision:
         "Compliance_Check": "compliance",
         "Delay_Management": "delay",
         "Planning_Query": "planning",
+        "General_Chat": "chat",
     }
     return RouteDecision(
         intent=intent,
@@ -305,9 +347,13 @@ def _classify_with_groq(user_input: str) -> RouteDecision:
         request_timeout=10,
     )
     system_prompt = """You are an airline operations router. Classify user intent into ONE of these exact strings:
-"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check", "Delay_Management", "Planning_Query"
+"Rule_Query", "Data_Query", "Flight_Status", "Schedule_Disruption", "Compliance_Check", "Delay_Management", "Planning_Query", "General_Chat"
 
 IMPORTANT: Handle typos and misspellings. Words like "dela", "delai", "delat", "delayy" all mean "delay". Words like "cancle", "cancel" mean "cancel".
+
+Use "General_Chat" for casual greetings and small talk with NO operational content:
+- "hi", "hello", "hey", "thanks", "thank you", "bye"
+- "what can you do", "how are you", "who are you", "how do i use this app"
 
 Use "Delay_Management" for ANY delay/cancel action:
 - "delay AI-301 by 2 hours", "delayed by 30 min", "dela by 7 hours", "cancel AI-501"
@@ -353,6 +399,7 @@ Return JSON: {"intent": "...", "extraction": {}, "confidence": 0.9}"""
         "Compliance_Check": "compliance",
         "Delay_Management": "delay",
         "Planning_Query": "planning",
+        "General_Chat": "chat",
     }
     return RouteDecision(
         intent=intent,
