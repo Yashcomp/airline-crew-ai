@@ -1136,23 +1136,6 @@ with tab_forecast:
     st.subheader("Daily Briefing — BLR Flights")
     st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments. Shows the **next 24 hours** of flights (rolling from now), with each flight's date labeled. Predictions weight this weekday's delay history from previous weeks (recency-decayed).")
 
-    from data.opensky_db import get_flight_stats as get_opensky_stats
-    _os_stats = get_opensky_stats(DEFAULT_DB_PATH)
-    if _os_stats.get("total_flights", 0) > 0:
-        _dr = _os_stats.get("date_range")
-        if _dr and _dr[0] and _dr[1]:
-            _d0 = datetime.strptime(_dr[0], "%Y-%m-%d").date()
-            _d1 = datetime.strptime(_dr[1], "%Y-%m-%d").date()
-            _n_days = (_d1 - _d0).days + 1
-            st.info(
-                f"**{_n_days}** days of data | "
-                f"**{_os_stats['total_flights']}** flights | "
-                f"**{_os_stats.get('weather_records', 0)}** weather records | "
-                f"{_dr[0]} to {_dr[1]}"
-            )
-        else:
-            st.info(f"**{_os_stats['total_flights']}** flights stored")
-
     if st.button("Run Daily Briefing", type="primary",
                  help="Seeds recent data, auto-trains the model if more than 24h since the last briefing, predicts delays, suggests crew."):
         with st.spinner("Running Daily Briefing — updating data, predicting delays, assigning crew..."):
@@ -1431,14 +1414,11 @@ with tab_forecast:
                 else:
                     st.metric(metric_label, metric_value)
 
-    else:
-        st.info("Click **Initialize System** (first time) then **Run Daily Briefing** to load predictions and crew suggestions.")
-
     with st.expander("Model Audit — Prediction vs Actual", expanded=False):
         audit_days = st.slider("Audit period (days)", 7, 60, 14, key="audit_days")
         audit_df = get_prediction_audit(days=audit_days, db_path=DEFAULT_DB_PATH)
         if audit_df.empty:
-            st.info("No audited predictions yet. Run **Seed** or **Daily Briefing** to start logging predictions.")
+            st.info("No audited predictions yet. Run **Daily Briefing** to start logging predictions.")
         else:
             metrics = compute_audit_metrics(audit_df)
             m1, m2, m3, m4, m5 = st.columns(5)
