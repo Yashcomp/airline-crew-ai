@@ -322,7 +322,6 @@ st.markdown(
     """
     <style>
     [data-testid='stChatMessage']{scroll-margin-bottom:6.5rem}
-    :root:has([data-testid='stTab'][aria-selected='true']:not([id='0'])) [data-testid='stBottom']{display:none !important}
     </style>
     """,
     unsafe_allow_html=True,
@@ -998,21 +997,25 @@ with tab_chat:
         (function () {
             var doc = parent.document;
             var key = "__airline_chat_count__";
-            function chatPanelVisible() {
-                var panels = doc.querySelectorAll('[data-testid="stTabPanel"]');
-                if (!panels.length) return true;
-                return panels[0].getClientRects().length > 0;
+            function chatActive() {
+                var tabs = doc.querySelector('[data-testid="stTabs"]');
+                if (!tabs) return true;
+                var buttons = tabs.querySelectorAll('[data-testid="stTab"]');
+                if (!buttons.length) return true;
+                var selected = tabs.querySelector('[data-testid="stTab"][aria-selected="true"]');
+                return selected === buttons[0];
             }
             function syncBar() {
                 var bar = doc.querySelector('[data-testid="stBottom"]');
                 if (!bar) return;
-                bar.style.display = chatPanelVisible() ? "" : "none";
+                bar.style.display = chatActive() ? "" : "none";
             }
             syncBar();
+            setTimeout(syncBar, 250);
             var msgs = doc.querySelectorAll('[data-testid="stChatMessage"]');
             var count = msgs.length;
             var prev = parent[key] || 0;
-            if (count > prev && chatPanelVisible() && count) {
+            if (count > prev && chatActive() && count) {
                 msgs[count - 1].scrollIntoView({ behavior: "smooth", block: "end" });
             }
             parent[key] = count;
