@@ -1312,13 +1312,15 @@ def get_today_schedule(
     from ml_engine.delay_predictor import predict_delay, _load_models, WEEKDAY_WEIGHT_DEFAULT
 
     path = db_path or DEFAULT_DB_PATH
-    today = datetime.now(timezone.utc)
-    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=path, day_of_week=today.weekday())
+    now = datetime.now(timezone.utc)
+    window_end = now + timedelta(hours=24)
+    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=path, day_of_week=now.weekday())
 
     _load_models()
 
     cached_weather: Dict[str, Dict] = {}
-    today_str = today.strftime("%Y-%m-%d")
+    today_str = now.strftime("%Y-%m-%d")
+    horizon_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     def _index_weather(records) -> None:
         for r in records:
@@ -1326,7 +1328,7 @@ def get_today_schedule(
             if isinstance(ts, str):
                 for h in range(24):
                     if f"T{h:02d}" in ts:
-                        cached_weather[f"{today_str}-{h:02d}"] = r
+                        cached_weather[f"{ts[:10]}-{h:02d}"] = r
                         break
 
     try:
@@ -1338,9 +1340,14 @@ def get_today_schedule(
             if records:
                 _cache_weather(records, path)
                 _index_weather(records)
+        tomorrow_records = get_forecast_weather(horizon_str, horizon_str)
+        if tomorrow_records:
+            _cache_weather(tomorrow_records, path)
+            _index_weather(tomorrow_records)
     except Exception:
         pass
 
+    kept: List[Dict[str, Any]] = []
     for flight in schedule:
         dep_hour = flight["avg_departure_hour"]
         dep_minute = flight["avg_departure_minute"]
@@ -1348,8 +1355,13 @@ def get_today_schedule(
         is_return = flight.get("is_return_leg", False)
         fid = flight["callsign"]
 
-        scheduled_dep = today.replace(hour=dep_hour, minute=dep_minute, second=0, microsecond=0)
+        scheduled_dep = now.replace(hour=dep_hour, minute=dep_minute, second=0, microsecond=0)
+        if scheduled_dep < now:
+            scheduled_dep += timedelta(days=1)
+        if scheduled_dep > window_end:
+            continue
         scheduled_arr = scheduled_dep + timedelta(minutes=duration)
+        dep_date_str = scheduled_dep.strftime("%Y-%m-%d")
 
         weather_key = scheduled_dep.strftime("%Y-%m-%d-%H")
         weather = cached_weather.get(weather_key, {})
@@ -1359,7 +1371,7 @@ def get_today_schedule(
             except Exception:
                 pass
 
-        cached_pred = _get_cached_prediction(fid, today_str, WEEKDAY_WEIGHT_DEFAULT, path)
+        cached_pred = _get_cached_prediction(fid, dep_date_str, WEEKDAY_WEIGHT_DEFAULT, path)
         if cached_pred:
             pred = cached_pred
         else:
@@ -1381,12 +1393,14 @@ def get_today_schedule(
                 dow_sample_count=flight.get("dow_sample_count"),
             )
             _save_cached_prediction(
-                fid, today_str,
+                fid, dep_date_str,
                 origin=flight["origin"], destination=flight["destination"],
                 departure_hour=dep_hour, pred=pred,
                 weekday_weight=WEEKDAY_WEIGHT_DEFAULT, db_path=path,
             )
 
+        flight["scheduled_date"] = dep_date_str
+        flight["scheduled_departure_dt"] = scheduled_dep
         flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
         flight["scheduled_arrival"] = scheduled_arr.strftime("%H:%M")
         flight["weather"] = {
@@ -1419,7 +1433,10 @@ def get_today_schedule(
                 f"Pre-departure crew assignment required before {scheduled_dep.strftime('%H:%M')} UTC"
             )
 
-    return schedule
+        kept.append(flight)
+
+    kept.sort(key=lambda f: f["scheduled_departure_dt"])
+    return kept
 
 
 def get_schedule_for_date(
@@ -1818,13 +1835,14 @@ def log_predictions(
                 if not pred:
                     continue
                 try:
+                    flight_date = f.get("scheduled_date") or today_str
                     conn.execute(
                         """INSERT OR REPLACE INTO prediction_log
                         (callsign, origin, destination, date, predicted_at,
                          delay_probability, expected_delay_min, risk_level)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
-                            f["callsign"], f["origin"], f["destination"], today_str, now_iso,
+                            f["callsign"], f["origin"], f["destination"], flight_date, now_iso,
                             pred["delay_probability"], pred["expected_delay_min"], pred["risk_level"],
                         ),
                     )

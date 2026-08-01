@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -1135,7 +1135,7 @@ with tab_forecast:
     st.caption("Predict delays and suggest DGCA-compliant crew assignments using OpenSky data and ML models.")
 
     st.subheader("Daily Briefing — BLR Flights")
-    st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments. Today's predictions weight this weekday's delay history from previous weeks (recency-decayed).")
+    st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments. Shows the **next 24 hours** of flights (rolling from now), with each flight's date labeled. Predictions weight this weekday's delay history from previous weeks (recency-decayed).")
 
     from data.opensky_db import get_flight_stats as get_opensky_stats
     _os_stats = get_opensky_stats(DEFAULT_DB_PATH)
@@ -1217,6 +1217,15 @@ with tab_forecast:
     at_risk = st.session_state.get("at_risk_crew", {})
     day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
+    def _date_label(scheduled_date: str) -> str:
+        d = datetime.strptime(scheduled_date, "%Y-%m-%d").date()
+        today_d = datetime.now(timezone.utc).date()
+        if d == today_d:
+            return "Today"
+        if d == today_d + timedelta(days=1):
+            return "Tomorrow"
+        return day_names[d.weekday()]
+
     if today_flights:
         high = [f for f in today_flights if f["prediction"]["risk_level"] == "High"]
         med = [f for f in today_flights if f["prediction"]["risk_level"] == "Medium"]
@@ -1258,9 +1267,9 @@ with tab_forecast:
 
                 with st.container():
                     leg_badge = ":blue[First Leg]" if leg_type == "First Leg" else ":green[Return Leg]"
-                    _dow_name = day_names[datetime.now().weekday()]
+                    _dow_name = day_names[datetime.strptime(f["scheduled_date"], "%Y-%m-%d").weekday()]
                     st.markdown(
-                        f"**{fid}** | {f['scheduled_departure']} | "
+                        f"**{fid}** | {_date_label(f['scheduled_date'])} {f['scheduled_departure']} | "
                         f"**{f['route']}** | {f['avg_duration_min']}min | "
                         f":{risk_color}[**{pred['risk_level']}**] "
                         f"Delay prob: **{pred['delay_probability']*100:.0f}%** | "
@@ -1370,7 +1379,8 @@ with tab_forecast:
             wx = f.get("weather", {})
             flights_data.append({
                 "Flight": f["callsign"],
-                "Time": f["scheduled_departure"],
+                "Date": f.get("scheduled_date", "Today"),
+                "Time": f"{_date_label(f['scheduled_date'])} {f['scheduled_departure']}",
                 "Route": f["route"],
                 "Duration": f"{f['avg_duration_min']}min",
                 "Leg": f.get("leg_type", "First Leg"),
