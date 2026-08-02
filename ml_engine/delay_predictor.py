@@ -21,11 +21,28 @@ _MODELS_DIR = Path(__file__).parent / "models"
 _CLASSIFIER_PATH = _MODELS_DIR / "delay_classifier.pkl"
 _REGRESSOR_PATH = _MODELS_DIR / "delay_regressor.pkl"
 _MODEL_METADATA_PATH = _MODELS_DIR / "model_metadata.pkl"
+_CALIBRATOR_PATH = _MODELS_DIR / "delay_calibrator.pkl"
+
+_calibrator_cache: Optional[object] = None
+_models_cache: Optional[Tuple[Optional[XGBClassifier], Optional[XGBRegressor]]] = None
 
 _DELAY_THRESHOLD_MIN = 15.0
 
 WEEKDAY_WEIGHT_DEFAULT = 0.75
 _WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE = 8
+
+_RISK_HIGH_PROB = 0.37
+_RISK_MEDIUM_PROB = 0.30
+_RISK_MEDIUM_PROB_BY_DOW = {
+    0: 0.30,  # Mon
+    1: 0.32,  # Tue
+    2: 0.28,  # Wed
+    3: 0.28,  # Thu
+    4: 0.30,  # Fri
+    5: 0.30,  # Sat
+    6: 0.32,  # Sun
+}
+_RISK_FLAG_THRESHOLD = _RISK_MEDIUM_PROB
 
 _WEATHER_BASELINE = {
     "wind_kmh": 21.0,
@@ -97,21 +114,28 @@ def _ensure_models_dir() -> None:
 
 
 def _load_models() -> Tuple[Optional[XGBClassifier], Optional[XGBRegressor]]:
+    global _models_cache
+    if _models_cache is not None:
+        return _models_cache
     if not _CLASSIFIER_PATH.exists() or not _REGRESSOR_PATH.exists():
         return None, None
     try:
         clf = joblib.load(_CLASSIFIER_PATH)
         reg = joblib.load(_REGRESSOR_PATH)
-        return clf, reg
+        _models_cache = (clf, reg)
+        return _models_cache
     except Exception:
         return None, None
 
 
 def _save_models(clf: XGBClassifier, reg: XGBRegressor, metadata: Dict[str, Any]) -> None:
+    global _models_cache, _calibrator_cache
     _ensure_models_dir()
     joblib.dump(clf, _CLASSIFIER_PATH)
     joblib.dump(reg, _REGRESSOR_PATH)
     joblib.dump(metadata, _MODEL_METADATA_PATH)
+    _models_cache = (clf, reg)
+    _calibrator_cache = None
 
 
 def _load_metadata() -> Dict[str, Any]:
@@ -123,6 +147,19 @@ def _load_metadata() -> Dict[str, Any]:
     return {}
 
 
+def _load_calibrator():
+    global _calibrator_cache
+    if _calibrator_cache is not None:
+        return _calibrator_cache
+    if not _CALIBRATOR_PATH.exists():
+        return None
+    try:
+        _calibrator_cache = joblib.load(_CALIBRATOR_PATH)
+        return _calibrator_cache
+    except Exception:
+        return None
+
+
 def _compute_class_weights(y: pd.Series) -> Dict[int, float]:
     counts = y.value_counts()
     total = len(y)
@@ -132,6 +169,23 @@ def _compute_class_weights(y: pd.Series) -> Dict[int, float]:
     return weights
 
 
+def _best_delay_threshold(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
+    from sklearn.metrics import f1_score, precision_score, recall_score
+    thresholds = np.arange(0.05, 0.901, 0.01)
+    best = {"threshold": 0.5, "f1": 0.0, "precision": 0.0, "recall": 0.0}
+    for t in thresholds:
+        pred = (y_proba >= t).astype(int)
+        f1 = f1_score(y_true, pred, zero_division=0)
+        if f1 > best["f1"] or (f1 == best["f1"] and t < best["threshold"]):
+            best = {
+                "threshold": round(float(t), 3),
+                "f1": round(float(f1), 4),
+                "precision": round(float(precision_score(y_true, pred, zero_division=0)), 4),
+                "recall": round(float(recall_score(y_true, pred, zero_division=0)), 4),
+            }
+    return best
+
+
 def train_model(
     min_samples: int = 30,
     callsigns: Optional[List[str]] = None,
@@ -139,8 +193,9 @@ def train_model(
 ) -> Dict[str, Any]:
     if callsigns:
         min_samples = min(min_samples, 5)
-    features, binary_target, reg_target, route_labels = get_training_data(
+    features, binary_target, reg_target, route_labels, dates = get_training_data(
         min_samples=min_samples, callsigns=callsigns, db_path=db_path,
+        with_dates=True,
     )
 
     if len(features) < min_samples:
@@ -163,23 +218,28 @@ def train_model(
     class_weights = _compute_class_weights(binary_target)
     sample_weights = binary_target.map(class_weights).values
 
+    delayed_mask = (binary_target == 1).to_numpy()
+    reg_features = features[delayed_mask]
+    reg_target_delayed = reg_target[delayed_mask].clip(lower=0, upper=240)
+    reg_groups = route_labels[delayed_mask].reset_index(drop=True)
+
     n_splits = min(5, route_labels.nunique())
     gkf = GroupKFold(n_splits=n_splits)
 
     clf_metrics_list = []
-    reg_metrics_list = []
+    oof_y: List[int] = []
+    oof_proba: List[float] = []
 
     for train_idx, test_idx in gkf.split(features, binary_target, groups=route_labels):
         X_tr, X_te = features.iloc[train_idx], features.iloc[test_idx]
         y_tr_clf, y_te_clf = binary_target.iloc[train_idx], binary_target.iloc[test_idx]
-        y_tr_reg, y_te_reg = reg_target.iloc[train_idx], reg_target.iloc[test_idx]
         sw_tr = sample_weights[train_idx]
 
         pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0)
 
         clf = XGBClassifier(
             n_estimators=150, max_depth=6, learning_rate=0.1,
-            eval_metric="logloss", random_state=42,
+            eval_metric="aucpr", random_state=42,
             reg_alpha=0.1, reg_lambda=1.0,
             scale_pos_weight=pos_weight,
             min_child_weight=2,
@@ -187,17 +247,11 @@ def train_model(
         )
         clf.fit(X_tr, y_tr_clf, sample_weight=sw_tr)
 
-        reg = XGBRegressor(
-            n_estimators=150, max_depth=6, learning_rate=0.1,
-            random_state=42, reg_alpha=0.1, reg_lambda=1.0,
-            min_child_weight=2,
-            subsample=0.9, colsample_bytree=0.9,
-        )
-        reg.fit(X_tr, y_tr_reg)
-
         y_te_pred = clf.predict(X_te)
         y_te_proba = clf.predict_proba(X_te)[:, 1] if hasattr(clf, "predict_proba") else y_te_pred.astype(float)
-        y_te_reg_pred = reg.predict(X_te)
+
+        oof_y.extend(y_te_clf.astype(int).tolist())
+        oof_proba.extend(y_te_proba.astype(float).tolist())
 
         n_delayed_te = int(y_te_clf.sum())
         n_clean_te = int(len(y_te_clf) - y_te_clf.sum())
@@ -219,12 +273,24 @@ def train_model(
         }
         clf_metrics_list.append(clf_m)
 
-        reg_m = {
-            "mae": mean_absolute_error(y_te_reg, y_te_reg_pred),
-            "rmse": float(np.sqrt(mean_squared_error(y_te_reg, y_te_reg_pred))),
-            "r2": r2_score(y_te_reg, y_te_reg_pred),
-        }
-        reg_metrics_list.append(reg_m)
+    reg_metrics_list = []
+    if len(reg_features) >= 20 and reg_groups.nunique() >= 2:
+        n_splits_reg = min(5, reg_groups.nunique())
+        gkf_reg = GroupKFold(n_splits=n_splits_reg)
+        for tr, te in gkf_reg.split(reg_features, reg_target_delayed, groups=reg_groups):
+            reg = XGBRegressor(
+                n_estimators=150, max_depth=6, learning_rate=0.1,
+                random_state=42, reg_alpha=0.1, reg_lambda=1.0,
+                min_child_weight=2,
+                subsample=0.9, colsample_bytree=0.9,
+            )
+            reg.fit(reg_features.iloc[tr], reg_target_delayed.iloc[tr])
+            p = reg.predict(reg_features.iloc[te])
+            reg_metrics_list.append({
+                "mae": mean_absolute_error(reg_target_delayed.iloc[te], p),
+                "rmse": float(np.sqrt(mean_squared_error(reg_target_delayed.iloc[te], p))),
+                "r2": r2_score(reg_target_delayed.iloc[te], p),
+            })
 
     def _avg_dicts(dicts, keys=None):
         if not dicts:
@@ -244,6 +310,77 @@ def train_model(
     avg_clf = _avg_dicts(clf_metrics_list)
     avg_reg = _avg_dicts(reg_metrics_list)
 
+    from sklearn.isotonic import IsotonicRegression
+
+    oof_y_arr = np.asarray(oof_y, dtype=float)
+    oof_proba_arr = np.asarray(oof_proba, dtype=float)
+    calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    calibrator.fit(oof_proba_arr, oof_y_arr)
+    cal_oof_proba = calibrator.predict(oof_proba_arr)
+    oof_threshold = _best_delay_threshold(oof_y_arr, cal_oof_proba)
+    joblib.dump(calibrator, _CALIBRATOR_PATH)
+
+    overall_rate = float(binary_target.mean())
+    prior_oof = features.apply(
+        lambda row: _prior_probability(
+            dow_delay_rate=row["dow_delay_rate"],
+            dow_sample_count=row["dow_delay_count"],
+            route_delay_rate=row["route_delay_rate"],
+            route_hour_delay_rate=row["route_hour_delay_rate"],
+            callsign_delay_rate=row["callsign_delay_rate"],
+            overall_delay_rate=overall_rate,
+        ),
+        axis=1,
+    ).to_numpy()
+
+    deployed_oof = np.clip(0.7 * prior_oof + 0.3 * cal_oof_proba, 0.05, 0.95)
+    oof_threshold = _best_delay_threshold(oof_y_arr, deployed_oof)
+    blend_weight_selected = 0.7
+
+    temporal_metrics = {}
+    if dates.notna().sum() > 0:
+        try:
+            unique_dates = sorted(dates.dropna().dt.normalize().unique())
+            if len(unique_dates) >= 3:
+                n_test_days = max(1, int(round(len(unique_dates) * 0.3)))
+                cutoff = unique_dates[-n_test_days]
+                te_mask = (dates.dt.normalize() >= cutoff).to_numpy()
+                tr_mask = ~te_mask
+                y_te_t = binary_target.to_numpy()[te_mask].astype(int)
+                y_tr_t = binary_target.to_numpy()[tr_mask].astype(int)
+                if te_mask.sum() >= 10 and tr_mask.sum() >= 10 and y_te_t.sum() > 0 and y_tr_t.sum() > 0:
+                    clf_temporal = XGBClassifier(
+                        n_estimators=150, max_depth=6, learning_rate=0.1,
+                        eval_metric="aucpr", random_state=42,
+                        reg_alpha=0.1, reg_lambda=1.0,
+                        scale_pos_weight=class_weights.get(1, 1.0) / class_weights.get(0, 1.0),
+                        min_child_weight=2,
+                        subsample=0.9, colsample_bytree=0.9,
+                    )
+                    clf_temporal.fit(features.iloc[tr_mask], binary_target.iloc[tr_mask],
+                                     sample_weight=sample_weights[tr_mask])
+                    proba_te_t = clf_temporal.predict_proba(features.iloc[te_mask])[:, 1]
+                    cal_te_t = calibrator.predict(proba_te_t)
+                    th_t = oof_threshold["threshold"]
+                    pred_te_t = (cal_te_t >= th_t).astype(int)
+                    temporal_metrics = {
+                        "test_start": str(unique_dates[-n_test_days]),
+                        "test_end": str(unique_dates[-1]),
+                        "train_end": str(unique_dates[-n_test_days - 1]),
+                        "test_samples": int(len(y_te_t)),
+                        "train_samples": int(len(y_tr_t)),
+                        "test_delay_rate": round(float(y_te_t.mean()), 4),
+                        "threshold": round(float(th_t), 4),
+                        "accuracy": round(float(accuracy_score(y_te_t, pred_te_t)), 4),
+                        "precision": round(float(precision_score(y_te_t, pred_te_t, zero_division=0)), 4),
+                        "recall": round(float(recall_score(y_te_t, pred_te_t, zero_division=0)), 4),
+                        "f1": round(float(f1_score(y_te_t, pred_te_t, zero_division=0)), 4),
+                        "roc_auc": round(float(roc_auc_score(y_te_t, cal_te_t)), 4),
+                        "pr_auc": round(float(average_precision_score(y_te_t, cal_te_t)), 4),
+                    }
+        except Exception as exc:
+            temporal_metrics = {"error": str(exc)}
+
     fold_clf_accs = [d["accuracy"] for d in clf_metrics_list]
     fold_clf_f1s = [d["f1"] for d in clf_metrics_list]
     fold_clf_aucs = [d["roc_auc"] for d in clf_metrics_list if d["roc_auc"] is not None]
@@ -253,15 +390,13 @@ def train_model(
     X_test_final = features.iloc[test_idx_final]
     y_train_final = binary_target.iloc[train_idx_final]
     y_test_final = binary_target.iloc[test_idx_final]
-    y_reg_train_final = reg_target.iloc[train_idx_final]
-    y_reg_test_final = reg_target.iloc[test_idx_final]
     sw_train_final = sample_weights[train_idx_final]
 
     pos_weight_final = class_weights.get(1, 1.0) / class_weights.get(0, 1.0)
 
     clf_final = XGBClassifier(
         n_estimators=150, max_depth=6, learning_rate=0.1,
-        eval_metric="logloss", random_state=42,
+        eval_metric="aucpr", random_state=42,
         reg_alpha=0.1, reg_lambda=1.0,
         scale_pos_weight=pos_weight_final,
         min_child_weight=2,
@@ -269,13 +404,22 @@ def train_model(
     )
     clf_final.fit(X_train_final, y_train_final, sample_weight=sw_train_final)
 
-    reg_final = XGBRegressor(
-        n_estimators=150, max_depth=6, learning_rate=0.1,
-        random_state=42, reg_alpha=0.1, reg_lambda=1.0,
-        min_child_weight=2,
-        subsample=0.9, colsample_bytree=0.9,
-    )
-    reg_final.fit(X_train_final, y_reg_train_final)
+    if len(reg_features) >= 20:
+        reg_final = XGBRegressor(
+            n_estimators=150, max_depth=6, learning_rate=0.1,
+            random_state=42, reg_alpha=0.1, reg_lambda=1.0,
+            min_child_weight=2,
+            subsample=0.9, colsample_bytree=0.9,
+        )
+        reg_final.fit(reg_features, reg_target_delayed)
+    else:
+        reg_final = XGBRegressor(
+            n_estimators=150, max_depth=6, learning_rate=0.1,
+            random_state=42, reg_alpha=0.1, reg_lambda=1.0,
+            min_child_weight=2,
+            subsample=0.9, colsample_bytree=0.9,
+        )
+        reg_final.fit(features, reg_target.clip(lower=0, upper=240))
 
     feature_importance = dict(zip(FEATURE_COLUMNS, clf_final.feature_importances_.tolist()))
 
@@ -291,6 +435,9 @@ def train_model(
         "classifier_cv": {k: round(v, 4) if isinstance(v, float) else v for k, v in avg_clf.items() if k != "confusion"},
         "classifier_test": {k: round(v, 4) if isinstance(v, float) else v for k, v in avg_clf.items() if k != "confusion"},
         "regressor_cv": {k: round(v, 4) for k, v in avg_reg.items()},
+        "optimal_threshold": oof_threshold,
+        "blend_weight": blend_weight_selected,
+        "temporal_test": temporal_metrics,
         "fold_accuracy": [round(a, 4) for a in fold_clf_accs],
         "fold_f1": [round(f, 4) for f in fold_clf_f1s],
         "fold_roc_auc": [round(a, 4) for a in fold_clf_aucs],
@@ -325,6 +472,11 @@ def train_model(
         "cv_roc_auc": round(cv_auc, 4) if cv_auc is not None else None,
         "cv_pr_auc": round(avg_clf.get("pr_auc", 0), 4) if avg_clf.get("pr_auc") is not None else None,
         "cv_log_loss": round(avg_clf.get("log_loss", 0), 4) if avg_clf.get("log_loss") is not None else None,
+        "optimal_threshold": oof_threshold["threshold"],
+        "threshold_f1": oof_threshold["f1"],
+        "threshold_precision": oof_threshold["precision"],
+        "threshold_recall": oof_threshold["recall"],
+        "temporal_test": temporal_metrics,
         "fold_accuracy": [round(a, 4) for a in fold_clf_accs],
         "fold_f1": [round(f, 4) for f in fold_clf_f1s],
         "fold_roc_auc": [round(a, 4) for a in fold_clf_aucs],
@@ -364,9 +516,16 @@ def _predict_with_ml(features_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
     try:
         prob = clf.predict_proba(features_df)[0]
-        delay_prob = float(prob[1]) if len(prob) > 1 else float(prob[0])
-        expected_delay = float(reg.predict(features_df)[0])
-        expected_delay = max(0.0, expected_delay)
+        raw_prob = float(prob[1]) if len(prob) > 1 else float(prob[0])
+        cal = _load_calibrator()
+        if cal is not None:
+            delay_prob = float(cal.predict(np.asarray([raw_prob]))[0])
+        else:
+            delay_prob = raw_prob
+        delay_prob = max(0.0, min(1.0, delay_prob))
+        cond_delay = float(reg.predict(features_df)[0])
+        cond_delay = max(0.0, min(240.0, cond_delay))
+        expected_delay = round(delay_prob * cond_delay, 1)
 
         feature_importance = {}
         if hasattr(clf, "feature_importances_"):
@@ -384,6 +543,26 @@ def _predict_with_ml(features_df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+def _prior_probability(
+    dow_delay_rate: float,
+    dow_sample_count: int,
+    route_delay_rate: float,
+    route_hour_delay_rate: float,
+    callsign_delay_rate: float,
+    overall_delay_rate: float = 0.0,
+) -> float:
+    base_rate = 0.075 if overall_delay_rate <= 0 else overall_delay_rate
+    conf = min(1.0, (dow_sample_count or 0) / 3.0)
+    if dow_delay_rate is None:
+        dow_delay_rate = 0.0
+    dow_term = dow_delay_rate * conf + base_rate * (1 - conf)
+    route_term = route_delay_rate if route_delay_rate else base_rate
+    hour_term = route_hour_delay_rate if route_hour_delay_rate else route_term
+    callsign_term = callsign_delay_rate if callsign_delay_rate else route_term
+    prob = 0.45 * dow_term + 0.25 * route_term + 0.15 * callsign_term + 0.15 * hour_term
+    return max(0.02, min(0.95, prob))
 
 
 def _heuristic_predict(
@@ -448,6 +627,10 @@ def predict_delay(
     overall_delay_rate: Optional[float] = None,
     weekday_weight: float = WEEKDAY_WEIGHT_DEFAULT,
     dow_sample_count: Optional[int] = None,
+    expected_duration_min: float = 0.0,
+    route_hour_delay_rate: float = 0.0,
+    route_delay_rate: float = 0.0,
+    callsign_delay_rate: float = 0.0,
 ) -> Dict[str, Any]:
     if departure_time is None:
         departure_time = datetime.now()
@@ -473,6 +656,12 @@ def predict_delay(
         precipitation_mm=precipitation_mm,
         temperature_c=temperature_c,
         pressure_hpa=pressure_hpa,
+        expected_duration_min=expected_duration_min,
+        route_hour_delay_rate=route_hour_delay_rate,
+        route_delay_rate=route_delay_rate,
+        callsign_delay_rate=callsign_delay_rate,
+        dow_delay_rate=dow_delay_rate or 0,
+        dow_delay_count=dow_sample_count or 0,
     )
 
     ml_result = _predict_with_ml(features_df)
@@ -484,38 +673,54 @@ def predict_delay(
             pax_count, flight_duration_min, is_international,
         )
 
+    prior_prob = _prior_probability(
+        dow_delay_rate=dow_delay_rate if dow_delay_rate is not None else 0,
+        dow_sample_count=dow_sample_count or 0,
+        route_delay_rate=route_delay_rate,
+        route_hour_delay_rate=route_hour_delay_rate,
+        callsign_delay_rate=callsign_delay_rate,
+        overall_delay_rate=overall_delay_rate or 0,
+    )
+
+    meta = _load_metadata()
+    blend_w = 0.7
+    if meta:
+        bw = meta.get("blend_weight")
+        if isinstance(bw, (int, float)) and 0 <= bw <= 1:
+            blend_w = float(bw)
+
+    old_prob = result["delay_probability"]
+    if result["model_used"] == "xgboost":
+        blended = blend_w * prior_prob + (1.0 - blend_w) * old_prob
+    else:
+        blended = prior_prob
+    cond_magnitude = result["expected_delay_min"] / old_prob if old_prob > 0 else 0
+
     weather_adj = _compute_weather_adjustment(
         wind_speed_kmh=wind_speed_kmh, wind_gusts_kmh=wind_gusts_kmh,
         visibility_m=visibility_m, precipitation_mm=precipitation_mm,
         cloud_cover_pct=cloud_cover_pct, departure_hour=departure_hour,
     )
-    base_prob = result["delay_probability"]
-    adjusted_prob = max(0.05, min(0.95, base_prob + weather_adj["probability_boost"]))
+    adjusted_prob = max(0.05, min(0.95, blended + weather_adj["probability_boost"]))
     result["delay_probability"] = round(adjusted_prob, 3)
-    result["expected_delay_min"] = round(result["expected_delay_min"] + weather_adj["delay_boost"], 1)
-
-    _GLOBAL_BASELINE_DELAY_RATE = 0.02
-    if dow_delay_rate is not None and overall_delay_rate is not None and overall_delay_rate > 0:
-        base_prob = result["delay_probability"]
-        scale_factor = dow_delay_rate / max(overall_delay_rate, _GLOBAL_BASELINE_DELAY_RATE)
-        scale_factor = max(0.3, min(3.0, scale_factor))
-        confidence = 1.0
-        if dow_sample_count is not None:
-            confidence = min(1.0, dow_sample_count / _WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE)
-        pull = 1.0 + (scale_factor - 1.0) * weekday_weight * confidence
-        adjusted_prob = base_prob * pull
-        adjusted_prob = max(0.05, min(0.95, adjusted_prob))
-        result["delay_probability"] = round(adjusted_prob, 3)
-        result["expected_delay_min"] = round(result["expected_delay_min"] * pull, 1)
+    result["expected_delay_min"] = round(adjusted_prob * cond_magnitude + weather_adj["delay_boost"], 1)
 
     prob = result["delay_probability"]
     exp_delay = result["expected_delay_min"]
+
+    if departure_time is not None:
+        medium_threshold = _RISK_MEDIUM_PROB_BY_DOW.get(departure_time.weekday(), _RISK_MEDIUM_PROB)
+    else:
+        medium_threshold = _RISK_MEDIUM_PROB
+    threshold = medium_threshold
+
     risk_score = prob * exp_delay
-    risk_level = "Low"
-    if prob > 0.15 or (prob > 0.10 and exp_delay > 5):
+    if prob >= _RISK_HIGH_PROB:
         risk_level = "High"
-    elif prob > 0.06 or (prob > 0.05 and exp_delay > 3):
+    elif prob >= medium_threshold:
         risk_level = "Medium"
+    else:
+        risk_level = "Low"
 
     factors = []
     if departure_hour in (8, 9, 17, 18, 19, 20):
@@ -567,6 +772,7 @@ def predict_delay(
 
     result.update({
         "risk_level": risk_level,
+        "predicted_delayed": bool(prob >= threshold),
         "factors": factors,
         "features": {
             "wind_speed_knots": round(wind_speed_kmh * 0.539957, 1),
@@ -604,7 +810,7 @@ def train_delay_model(flight_data: List[Dict[str, Any]]) -> Dict[str, Any]:
             is_international=record.get("is_international", False),
         )
         was_delayed = record.get("actual_delay_min", 0) > _DELAY_THRESHOLD_MIN
-        predicted_delayed = predicted["delay_probability"] > 0.3
+        predicted_delayed = predicted["predicted_delayed"]
         if was_delayed == predicted_delayed:
             correct += 1
 
@@ -671,6 +877,7 @@ def get_delay_insights(db_path: Optional[Path] = None) -> Dict[str, Any]:
             "cv_mcc": cv.get("mcc"),
             "cv_roc_auc": cv.get("roc_auc"),
             "cv_mae": model_meta.get("regressor_cv", {}).get("mae"),
+            "optimal_threshold": model_meta.get("optimal_threshold", {}).get("threshold"),
         },
     }
 

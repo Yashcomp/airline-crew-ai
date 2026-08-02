@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import csv
 import json
 import sqlite3
@@ -309,17 +310,20 @@ def compute_rotation_chains(db_path: Optional[Path] = None) -> int:
                   first_seen, last_seen, duration_min, date
            FROM opensky_flights
            WHERE first_seen IS NOT NULL
-           ORDER BY icao24, first_seen"""
+           ORDER BY icao24, date, first_seen"""
     ).fetchall()
     count = 0
     current_icao = None
+    current_date = None
     seq = 0
     prev_delay: Optional[float] = None
     prev_last_seen: Optional[int] = None
+    max_turnaround_gap_min = 240.0
     for r in rows:
         icao = r["icao24"]
-        if icao != current_icao:
+        if icao != current_icao or r["date"] != current_date:
             current_icao = icao
+            current_date = r["date"]
             seq = 0
             prev_delay = None
             prev_last_seen = None
@@ -329,7 +333,7 @@ def compute_rotation_chains(db_path: Optional[Path] = None) -> int:
         if prev_last_seen and r["first_seen"]:
             actual_gap_min = (r["first_seen"] - prev_last_seen) / 60.0
             turn_deviation = actual_gap_min - expected_gap_min
-            if turn_deviation > 15:
+            if actual_gap_min <= max_turnaround_gap_min and turn_deviation > 15:
                 prev_delay = turn_deviation
             else:
                 prev_delay = 0.0
@@ -356,9 +360,18 @@ def compute_rotation_chains(db_path: Optional[Path] = None) -> int:
 
 
 def compute_delay_labels(
-    delay_threshold_pct: float = 0.20,
+    delay_threshold_min: float = 15.0,
     db_path: Optional[Path] = None,
 ) -> int:
+    """Build delay labels as DEPARTURE-TIME delay vs the flight's own schedule.
+
+    The schedule for a callsign+route is the leave-one-out median of its actual
+    first_seen time-of-day (UTC), so a row never informs its own schedule.
+    ``deviation_min`` is the wrapped difference (actual - scheduled) and a
+    flight is delayed when it departs more than ``delay_threshold_min`` late.
+    expected/actual duration are kept as auxiliary columns (route median) for
+    features/display but no longer drive the label.
+    """
     path = db_path or DEFAULT_DB_PATH
     conn = _connect(path)
     conn.execute("DELETE FROM delay_labels")
@@ -369,75 +382,73 @@ def compute_delay_labels(
            WHERE duration_min IS NOT NULL AND first_seen IS NOT NULL"""
     ).fetchall()
 
+    def _tod(ts: int) -> float:
+        return float(int(ts) % 86400)
+
+    def _wrap_delta(actual: float, scheduled: float) -> float:
+        d = actual - scheduled
+        if d >= 43200:
+            d -= 86400
+        elif d < -43200:
+            d += 86400
+        return d
+
+    def _median_without(vals: List[float], tod: float) -> Optional[float]:
+        pos = bisect.bisect_left(vals, tod)
+        others = vals[:pos] + vals[pos + 1:]
+        if not others:
+            return None
+        return statistics.median(others)
+
     per_route: Dict[str, List[float]] = {}
+    cs_tods: Dict[str, List[float]] = {}
+    route_tods: Dict[str, List[float]] = {}
     for r in rows:
         origin = r["origin_airport"]
         dest = r["destination_airport"]
         if not origin or not dest:
             continue
-        per_route.setdefault(f"{origin}_{dest}", []).append(r["duration_min"])
-    route_medians: Dict[str, float] = {
+        route = f"{origin}_{dest}"
+        tod = _tod(r["first_seen"])
+        per_route.setdefault(route, []).append(r["duration_min"])
+        route_tods.setdefault(route, []).append(tod)
+        callsign = r["callsign"]
+        if callsign:
+            cs_tods.setdefault(f"{callsign}_{route}", []).append(tod)
+
+    route_dur_medians: Dict[str, float] = {
         key: statistics.median(durations) for key, durations in per_route.items()
     }
+    cs_sorted = {k: sorted(v) for k, v in cs_tods.items()}
+    route_sorted = {k: sorted(v) for k, v in route_tods.items()}
 
-    clean_rows = []
+    count = 0
     for r in rows:
         origin = r["origin_airport"]
         dest = r["destination_airport"]
         if not origin or not dest:
             continue
-        median = route_medians.get(f"{origin}_{dest}")
-        if median is None:
-            continue
-        ceiling = max(3.0 * median, 120.0)
-        if (r["duration_min"] or 0) > ceiling:
-            continue
-        clean_rows.append(r)
+        route = f"{origin}_{dest}"
+        tod = _tod(r["first_seen"])
 
-    route_hours: Dict[str, Dict[int, List[float]]] = {}
-    for r in clean_rows:
-        origin = r["origin_airport"]
-        dest = r["destination_airport"]
-        key = f"{origin}_{dest}"
+        scheduled = None
+        if r["callsign"]:
+            cs_key = f"{r['callsign']}_{route}"
+            if cs_key in cs_sorted:
+                scheduled = _median_without(cs_sorted[cs_key], tod)
+        if scheduled is None and route in route_sorted:
+            scheduled = _median_without(route_sorted[route], tod)
+        if scheduled is None:
+            scheduled = tod
+
+        deviation_sec = _wrap_delta(tod, scheduled)
+        deviation_min = deviation_sec / 60.0
+        if abs(deviation_min) > 720.0:
+            continue
+        is_delayed = 1 if deviation_min > delay_threshold_min else 0
+
         dt = datetime.fromtimestamp(r["first_seen"], tz=timezone.utc)
-        hour_bucket = dt.hour // 3 * 3
-        route_hours.setdefault(key, {}).setdefault(hour_bucket, []).append(r["duration_min"])
-
-    route_expected: Dict[str, Dict[int, float]] = {}
-    for key, hours in route_hours.items():
-        route_expected[key] = {}
-        for hour_bucket, durations in hours.items():
-            route_expected[key][hour_bucket] = statistics.median(durations)
-
-    route_avgs: Dict[str, float] = {}
-    for key, hours in route_hours.items():
-        all_durations = [d for bucket_durs in hours.values() for d in bucket_durs]
-        if all_durations:
-            route_avgs[key] = statistics.median(all_durations)
-
-    count = 0
-    for r in clean_rows:
-        origin = r["origin_airport"]
-        dest = r["destination_airport"]
-        if not origin or not dest:
-            continue
-        key = f"{origin}_{dest}"
-        dt = datetime.fromtimestamp(r["first_seen"], tz=timezone.utc)
-        hour_bucket = dt.hour // 3 * 3
-
-        expected = None
-        if key in route_expected and hour_bucket in route_expected[key]:
-            expected = route_expected[key][hour_bucket]
-        if expected is None:
-            expected = route_avgs.get(key)
-        if expected is None:
-            expected = r["duration_min"]
-        if expected is None:
-            continue
-
-        deviation = (r["duration_min"] or 0) - expected
-        threshold = max(expected * delay_threshold_pct, 10.0)
-        is_delayed = 1 if deviation > threshold else 0
+        expected_dur = route_dur_medians.get(route, r["duration_min"])
 
         flight_id = r["flight_id"] if r["flight_id"] else f"{r['icao24']}_{r['first_seen']}"
         try:
@@ -449,8 +460,8 @@ def compute_delay_labels(
                 (
                     flight_id, origin, dest, r["date"],
                     dt.hour, dt.weekday(),
-                    r["duration_min"], round(expected, 1),
-                    round(deviation, 1), is_delayed,
+                    r["duration_min"], round(expected_dur, 1),
+                    round(deviation_min, 1), is_delayed,
                 ),
             )
             count += 1
@@ -632,6 +643,9 @@ def get_feature_table(db_path: Optional[Path] = None) -> pd.DataFrame:
                 f.first_seen, f.last_seen, f.duration_min, f.date, f.aircraft_type,
                 rc.prev_flight_delay_min, rc.flight_sequence,
                 dl.departure_hour, dl.day_of_week, dl.deviation_min, dl.is_delayed,
+                dl.expected_duration_min,
+                dr.route_hour_delay_rate, dr.route_delay_rate, dr.callsign_delay_rate,
+                dr.route_hour_count, dr.route_count, dr.callsign_count,
                 w.temperature_c, w.wind_speed_kmh, w.wind_gusts_kmh,
                 w.visibility_m, w.cloud_cover_pct, w.cloud_cover_low_pct,
                 w.precipitation_mm, w.pressure_hpa, w.weather_code
@@ -643,6 +657,44 @@ def get_feature_table(db_path: Optional[Path] = None) -> pd.DataFrame:
                    AND f.origin_airport = dl.origin
                    AND f.destination_airport = dl.destination
                    AND f.date = dl.date
+               LEFT JOIN (
+                   SELECT flight_id, origin, destination, departure_hour, date,
+                          ROUND(AVG(is_delayed) OVER (
+                              PARTITION BY origin, destination, departure_hour
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ), 4) AS route_hour_delay_rate,
+                          COUNT(*) OVER (
+                              PARTITION BY origin, destination, departure_hour
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ) AS route_hour_count,
+                          ROUND(AVG(is_delayed) OVER (
+                              PARTITION BY origin, destination
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ), 4) AS route_delay_rate,
+                          COUNT(*) OVER (
+                              PARTITION BY origin, destination
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ) AS route_count,
+                          ROUND(AVG(is_delayed) OVER (
+                              PARTITION BY flight_id
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ), 4) AS callsign_delay_rate,
+                          COUNT(*) OVER (
+                              PARTITION BY flight_id
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ) AS callsign_count
+                   FROM delay_labels
+               ) dr
+                 ON dr.flight_id = dl.flight_id
+                AND dr.origin = dl.origin
+                AND dr.destination = dl.destination
+                AND dr.date = dl.date
                LEFT JOIN weather_cache w
                  ON w.timestamp = f.date || 'T' || printf('%02d:00',
                     CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
@@ -750,6 +802,9 @@ def get_filtered_feature_table(
                 f.first_seen, f.last_seen, f.duration_min, f.date, f.aircraft_type,
                 rc.prev_flight_delay_min, rc.flight_sequence,
                 dl.departure_hour, dl.day_of_week, dl.deviation_min, dl.is_delayed,
+                dl.expected_duration_min,
+                dr.route_hour_delay_rate, dr.route_delay_rate, dr.callsign_delay_rate,
+                dr.route_hour_count, dr.route_count, dr.callsign_count,
                 w.temperature_c, w.wind_speed_kmh, w.wind_gusts_kmh,
                 w.visibility_m, w.cloud_cover_pct, w.cloud_cover_low_pct,
                 w.precipitation_mm, w.pressure_hpa, w.weather_code
@@ -761,6 +816,44 @@ def get_filtered_feature_table(
                    AND f.origin_airport = dl.origin
                    AND f.destination_airport = dl.destination
                    AND f.date = dl.date
+               LEFT JOIN (
+                   SELECT flight_id, origin, destination, departure_hour, date,
+                          ROUND(AVG(is_delayed) OVER (
+                              PARTITION BY origin, destination, departure_hour
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ), 4) AS route_hour_delay_rate,
+                          COUNT(*) OVER (
+                              PARTITION BY origin, destination, departure_hour
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ) AS route_hour_count,
+                          ROUND(AVG(is_delayed) OVER (
+                              PARTITION BY origin, destination
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ), 4) AS route_delay_rate,
+                          COUNT(*) OVER (
+                              PARTITION BY origin, destination
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ) AS route_count,
+                          ROUND(AVG(is_delayed) OVER (
+                              PARTITION BY flight_id
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ), 4) AS callsign_delay_rate,
+                          COUNT(*) OVER (
+                              PARTITION BY flight_id
+                              ORDER BY date
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                          ) AS callsign_count
+                   FROM delay_labels
+               ) dr
+                 ON dr.flight_id = dl.flight_id
+                AND dr.origin = dl.origin
+                AND dr.destination = dl.destination
+                AND dr.date = dl.date
                LEFT JOIN weather_cache w
                  ON w.timestamp = f.date || 'T' || printf('%02d:00',
                     CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
@@ -1255,6 +1348,10 @@ def get_model_flights_with_status(
     return schedule
 
 
+def _get_optimal_threshold() -> float:
+    return 0.30
+
+
 def _get_cached_prediction(
     callsign: str,
     date: str,
@@ -1285,12 +1382,15 @@ def _get_cached_prediction(
         factors = json.loads(row["factors"]) if row["factors"] else []
     except Exception:
         factors = []
+    threshold = _get_optimal_threshold()
+    prob = row["delay_probability"]
     return {
-        "delay_probability": row["delay_probability"],
+        "delay_probability": prob,
         "expected_delay_min": row["expected_delay_min"],
         "risk_level": row["risk_level"],
         "factors": factors,
         "model_used": row["model_used"],
+        "predicted_delayed": bool(prob >= threshold),
     }
 
 
@@ -1400,6 +1500,10 @@ def get_today_schedule(
         if cached_pred:
             pred = cached_pred
         else:
+            rates = get_delay_rates(
+                callsign=fid, origin=flight["origin"], destination=flight["destination"],
+                dep_hour=dep_hour, target_date=dep_date_str, db_path=path,
+            )
             pred = predict_delay(
                 origin=flight["origin"],
                 destination=flight["destination"],
@@ -1416,6 +1520,10 @@ def get_today_schedule(
                 dow_delay_rate=flight.get("dow_delay_rate"),
                 overall_delay_rate=flight.get("overall_delay_rate"),
                 dow_sample_count=flight.get("dow_sample_count"),
+                expected_duration_min=rates.get("expected_duration_min", 0),
+                route_hour_delay_rate=rates.get("route_hour_delay_rate", 0),
+                route_delay_rate=rates.get("route_delay_rate", 0),
+                callsign_delay_rate=rates.get("callsign_delay_rate", 0),
             )
             _save_cached_prediction(
                 fid, dep_date_str,
@@ -1440,6 +1548,7 @@ def get_today_schedule(
             "risk_level": pred["risk_level"],
             "factors": pred.get("factors", []),
             "model_used": pred["model_used"],
+            "predicted_delayed": pred.get("predicted_delayed", bool(pred["delay_probability"] >= _get_optimal_threshold())),
         }
 
         if is_return:
@@ -1462,6 +1571,84 @@ def get_today_schedule(
 
     kept.sort(key=lambda f: f["scheduled_departure_dt"])
     return kept
+
+
+def get_delay_rates(
+    callsign: Optional[str],
+    origin: Optional[str],
+    destination: Optional[str],
+    dep_hour: Optional[int] = None,
+    target_date: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, float]:
+    """Prior-date delay rates for inference on a scheduled flight.
+
+    Uses only delay_labels rows strictly before ``target_date`` (no leakage).
+    Returns rates rounded to 4 decimals; missing keys default to 0.
+    """
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return {}
+    conn = _connect(path)
+    try:
+        rates: Dict[str, float] = {}
+
+        date_filter = "AND date < ?" if target_date else ""
+        date_param = (target_date,) if target_date else ()
+
+        if origin and destination:
+            if dep_hour is not None:
+                row = conn.execute(
+                    f"""SELECT ROUND(AVG(is_delayed), 4) AS rate
+                        FROM delay_labels
+                        WHERE origin = ? AND destination = ? AND departure_hour = ?
+                        {date_filter}""",
+                    (origin, destination, int(dep_hour)) + date_param,
+                ).fetchone()
+                if row and row["rate"] is not None:
+                    rates["route_hour_delay_rate"] = row["rate"]
+
+            row = conn.execute(
+                f"""SELECT ROUND(AVG(is_delayed), 4) AS rate
+                    FROM delay_labels
+                    WHERE origin = ? AND destination = ?
+                    {date_filter}""",
+                (origin, destination) + date_param,
+            ).fetchone()
+            if row and row["rate"] is not None:
+                rates["route_delay_rate"] = row["rate"]
+
+            durs = conn.execute(
+                """SELECT actual_duration_min AS d
+                   FROM delay_labels
+                   WHERE origin = ? AND destination = ?
+                     AND actual_duration_min IS NOT NULL""",
+                (origin, destination),
+            ).fetchall()
+            if durs:
+                rates["expected_duration_min"] = round(statistics.median(r["d"] for r in durs), 1)
+
+        if callsign:
+            cs_upper = callsign.upper()
+            resolved_fid, _, _ = _resolve_flight(callsign, origin, destination)
+            ids = [cs_upper]
+            if resolved_fid and resolved_fid != cs_upper:
+                ids.append(resolved_fid)
+            placeholders = ",".join("?" for _ in ids)
+            row = conn.execute(
+                f"""SELECT ROUND(AVG(is_delayed), 4) AS rate
+                    FROM delay_labels
+                    WHERE flight_id IN ({placeholders})
+                    {date_filter}""",
+                tuple(ids) + date_param,
+            ).fetchone()
+            if row and row["rate"] is not None:
+                rates["callsign_delay_rate"] = row["rate"]
+    except sqlite3.OperationalError:
+        rates = {}
+    finally:
+        conn.close()
+    return rates
 
 
 def get_schedule_for_date(
@@ -1515,6 +1702,11 @@ def get_schedule_for_date(
             except Exception:
                 pass
 
+        rates = get_delay_rates(
+            callsign=flight.get("callsign"), origin=flight["origin"],
+            destination=flight["destination"], dep_hour=dep_hour,
+            target_date=dt.strftime("%Y-%m-%d"), db_path=db_path,
+        )
         pred = predict_delay(
             origin=flight["origin"],
             destination=flight["destination"],
@@ -1531,6 +1723,10 @@ def get_schedule_for_date(
             dow_delay_rate=flight.get("dow_delay_rate"),
             overall_delay_rate=flight.get("overall_delay_rate"),
             dow_sample_count=flight.get("dow_sample_count"),
+            expected_duration_min=rates.get("expected_duration_min", 0),
+            route_hour_delay_rate=rates.get("route_hour_delay_rate", 0),
+            route_delay_rate=rates.get("route_delay_rate", 0),
+            callsign_delay_rate=rates.get("callsign_delay_rate", 0),
         )
 
         flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
@@ -1547,6 +1743,7 @@ def get_schedule_for_date(
             "risk_level": pred["risk_level"],
             "factors": pred.get("factors", []),
             "model_used": pred["model_used"],
+            "predicted_delayed": pred.get("predicted_delayed", bool(pred["delay_probability"] >= _get_optimal_threshold())),
         }
 
         if is_return:
@@ -1973,30 +2170,202 @@ def get_last_briefing_time(
         return None
 
 
-def backfill_predictions(db_path: Optional[Path] = None) -> int:
+def _load_prior_delay_rows(db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Load all delay_labels rows once for leak-free per-flight weekday priors."""
     path = db_path or DEFAULT_DB_PATH
-    init_opensky_tables(db_path)
+    if not path.exists():
+        return []
     conn = _connect(path)
     try:
-        dates = conn.execute(
-            "SELECT DISTINCT date FROM delay_labels WHERE date IS NOT NULL ORDER BY date"
+        return conn.execute(
+            "SELECT flight_id, origin, destination, date, is_delayed "
+            "FROM delay_labels WHERE date IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
+def _lookup_dow_prior(
+    flight_idx,
+    route_idx,
+    global_sum: float,
+    global_n: int,
+    flight_id: str,
+    origin: str,
+    destination: str,
+    dow: int,
+) -> Tuple[Optional[float], int, float]:
+    """Same-weekday prior from rows strictly before the target date.
+
+    Uses the flight's own history first, then the route's, then the global
+    prior-date average. Returns (rate, sample_count, overall_rate).
+    """
+    overall = round(global_sum / global_n, 4) if global_n else 0.075
+    fb = flight_idx.get((flight_id, dow))
+    if fb and fb[1] >= 1:
+        return round(fb[0] / fb[1], 4), fb[1], overall
+    rb = route_idx.get((origin, destination, dow))
+    if rb and rb[1] >= 1:
+        return round(rb[0] / rb[1], 4), rb[1], overall
+    return None, 0, overall
+
+
+def backfill_predictions(db_path: Optional[Path] = None, max_days: Optional[int] = None) -> int:
+    """Generate predictions for every delay_labels flight per date (full coverage).
+
+    Unlike the top-20 schedule, this iterates all observed flights so the audit
+    sample matches the true delay base rate. ``max_days`` restricts to the most
+    recent N days when provided.
+    """
+    from ml_engine.delay_predictor import predict_delay, _load_models
+
+    path = db_path or DEFAULT_DB_PATH
+    init_opensky_tables(db_path)
+    _load_models()
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT flight_id, origin, destination, date, departure_hour "
+            "FROM delay_labels "
+            "WHERE date IS NOT NULL AND origin IS NOT NULL AND destination IS NOT NULL "
+            "ORDER BY date"
         ).fetchall()
     finally:
         conn.close()
 
+    dates = sorted({r["date"] for r in rows})
+    if max_days:
+        cutoff = (date.today() - timedelta(days=max_days)).strftime("%Y-%m-%d")
+        dates = [d for d in dates if d >= cutoff]
+        if dates:
+            placeholders = ",".join("?" for _ in dates)
+            conn = _connect_write(path)
+            try:
+                conn.execute(
+                    f"DELETE FROM prediction_log WHERE date IN ({placeholders})",
+                    tuple(dates),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    prior_rows = _load_prior_delay_rows(path)
+    prior_rows_sorted = sorted(
+        (r for r in prior_rows if r["date"]),
+        key=lambda r: r["date"],
+    )
+    flight_idx: Dict[Tuple[str, int], List[float]] = {}
+    route_idx: Dict[Tuple[str, str, int], List[float]] = {}
+    global_sum = 0.0
+    global_n = 0
+    prior_ptr = 0
+
+    def _accumulate_priors(upto_date: str) -> None:
+        """Fold prior rows with date < upto_date into the weekday indexes (leak-free)."""
+        nonlocal prior_ptr, global_sum, global_n
+        while prior_ptr < len(prior_rows_sorted) and prior_rows_sorted[prior_ptr]["date"] < upto_date:
+            r = prior_rows_sorted[prior_ptr]
+            prior_ptr += 1
+            is_d = r["is_delayed"]
+            if is_d is None:
+                continue
+            try:
+                r_dow = date.fromisoformat(r["date"]).weekday()
+            except (ValueError, TypeError):
+                continue
+            v = float(is_d)
+            global_sum += v
+            global_n += 1
+            key_f = (r["flight_id"], r_dow)
+            bucket = flight_idx.get(key_f)
+            if bucket is None:
+                bucket = [0.0, 0]
+                flight_idx[key_f] = bucket
+            bucket[0] += v
+            bucket[1] += 1
+            key_r = (r["origin"], r["destination"], r_dow)
+            bucket = route_idx.get(key_r)
+            if bucket is None:
+                bucket = [0.0, 0]
+                route_idx[key_r] = bucket
+            bucket[0] += v
+            bucket[1] += 1
+
     total = 0
-    for row in dates:
-        d = row["date"]
-        if not d:
-            continue
+    for d in dates:
+        _accumulate_priors(d)
+        day_rows = [r for r in rows if r["date"] == d]
+        target_dt = datetime.strptime(d, "%Y-%m-%d").date()
+        dow = target_dt.weekday()
+
         try:
-            schedule = get_schedule_for_date(d, db_path=path)
+            records = get_historical_weather(d, d) or get_forecast_weather(d, d) or []
         except Exception:
-            continue
-        if not schedule:
-            continue
-        log_predictions(schedule, db_path=path, target_date=d)
-        total += len(schedule)
+            records = []
+        cached_weather: Dict[str, Dict] = {}
+        for rec in records:
+            ts = rec.get("timestamp", "")
+            if isinstance(ts, str):
+                for h in range(24):
+                    if f"T{h:02d}" in ts:
+                        cached_weather[f"{ts[:10]}-{h:02d}"] = rec
+                        break
+
+        schedule = []
+        for r in day_rows:
+            fid = r["flight_id"]
+            origin = r["origin"]
+            destination = r["destination"]
+            hour = int(r["departure_hour"] or 12)
+            dep_dt = datetime.combine(target_dt, datetime.time(hour=hour)).replace(tzinfo=timezone.utc)
+            weather_key = dep_dt.strftime("%Y-%m-%d-%H")
+            weather = cached_weather.get(weather_key, {})
+            if not weather:
+                try:
+                    weather = get_weather_at_time(dep_dt)
+                except Exception:
+                    pass
+
+            rates = get_delay_rates(
+                callsign=fid, origin=origin, destination=destination,
+                dep_hour=hour, target_date=d, db_path=path,
+            )
+            dow_rate, dow_n, overall = _lookup_dow_prior(
+                flight_idx, route_idx, global_sum, global_n, fid, origin, destination, dow,
+            )
+            pred = predict_delay(
+                origin=origin,
+                destination=destination,
+                departure_hour=hour,
+                departure_time=dep_dt,
+                wind_speed_kmh=weather.get("wind_speed_kmh") or 0,
+                wind_gusts_kmh=weather.get("wind_gusts_kmh") or 0,
+                visibility_m=weather.get("visibility_m") or 10000,
+                cloud_cover_pct=weather.get("cloud_cover_pct") or 0,
+                precipitation_mm=weather.get("precipitation_mm") or 0,
+                temperature_c=weather.get("temperature_c") or 25,
+                pressure_hpa=weather.get("pressure_hpa") or 1013,
+                dow_delay_rate=dow_rate,
+                overall_delay_rate=overall,
+                dow_sample_count=dow_n,
+                expected_duration_min=rates.get("expected_duration_min", 0),
+                route_hour_delay_rate=rates.get("route_hour_delay_rate", 0),
+                route_delay_rate=rates.get("route_delay_rate", 0),
+                callsign_delay_rate=rates.get("callsign_delay_rate", 0),
+            )
+            schedule.append({
+                "callsign": fid,
+                "origin": origin,
+                "destination": destination,
+                "scheduled_date": d,
+                "prediction": pred,
+            })
+
+        if schedule:
+            log_predictions(schedule, db_path=path, target_date=d)
+            total += len(schedule)
     return total
 
 
@@ -2067,9 +2436,13 @@ def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
     if audit_df.empty:
         return {"total": 0, "message": "No audit data available."}
 
+    audit_df = audit_df.copy()
+    threshold = 0.30
+    audit_df["predicted_delayed"] = audit_df["risk_level"].isin(["High", "Medium"])
+
     total = len(audit_df)
-    predicted_high_med = audit_df["risk_level"].isin(["High", "Medium"])
-    predicted_low = audit_df["risk_level"] == "Low"
+    predicted_high_med = audit_df["predicted_delayed"]
+    predicted_low = ~audit_df["predicted_delayed"]
     actually_delayed = audit_df["actual_is_delayed"] == 1
     actually_not_delayed = audit_df["actual_is_delayed"] == 0
 
@@ -2117,8 +2490,6 @@ def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
                 "avg_actual_delay_min": round(sub["actual_delay_min"].abs().mean(), 1) if sub["actual_delay_min"].notna().any() else 0,
             })
 
-    audit_df = audit_df.copy()
-    audit_df["predicted_delayed"] = audit_df["risk_level"].isin(["High", "Medium"])
     audit_df["match"] = audit_df.apply(
         lambda r: "Correct" if r["predicted_delayed"] == bool(r["actual_is_delayed"])
         else ("Miss" if r["actual_is_delayed"] == 1 else "False Alarm"),
@@ -2127,6 +2498,7 @@ def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
 
     return {
         "total": total,
+        "threshold": threshold,
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
