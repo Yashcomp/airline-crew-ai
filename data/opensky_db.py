@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
+import statistics
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -368,12 +369,35 @@ def compute_delay_labels(
            WHERE duration_min IS NOT NULL AND first_seen IS NOT NULL"""
     ).fetchall()
 
-    route_hours: Dict[str, Dict[int, List[float]]] = {}
+    per_route: Dict[str, List[float]] = {}
     for r in rows:
         origin = r["origin_airport"]
         dest = r["destination_airport"]
         if not origin or not dest:
             continue
+        per_route.setdefault(f"{origin}_{dest}", []).append(r["duration_min"])
+    route_medians: Dict[str, float] = {
+        key: statistics.median(durations) for key, durations in per_route.items()
+    }
+
+    clean_rows = []
+    for r in rows:
+        origin = r["origin_airport"]
+        dest = r["destination_airport"]
+        if not origin or not dest:
+            continue
+        median = route_medians.get(f"{origin}_{dest}")
+        if median is None:
+            continue
+        ceiling = max(3.0 * median, 120.0)
+        if (r["duration_min"] or 0) > ceiling:
+            continue
+        clean_rows.append(r)
+
+    route_hours: Dict[str, Dict[int, List[float]]] = {}
+    for r in clean_rows:
+        origin = r["origin_airport"]
+        dest = r["destination_airport"]
         key = f"{origin}_{dest}"
         dt = datetime.fromtimestamp(r["first_seen"], tz=timezone.utc)
         hour_bucket = dt.hour // 3 * 3
@@ -383,16 +407,16 @@ def compute_delay_labels(
     for key, hours in route_hours.items():
         route_expected[key] = {}
         for hour_bucket, durations in hours.items():
-            route_expected[key][hour_bucket] = sum(durations) / len(durations)
+            route_expected[key][hour_bucket] = statistics.median(durations)
 
     route_avgs: Dict[str, float] = {}
     for key, hours in route_hours.items():
         all_durations = [d for bucket_durs in hours.values() for d in bucket_durs]
         if all_durations:
-            route_avgs[key] = sum(all_durations) / len(all_durations)
+            route_avgs[key] = statistics.median(all_durations)
 
     count = 0
-    for r in rows:
+    for r in clean_rows:
         origin = r["origin_airport"]
         dest = r["destination_airport"]
         if not origin or not dest:
@@ -618,9 +642,10 @@ def get_feature_table(db_path: Optional[Path] = None) -> pd.DataFrame:
                  ON dl.flight_id = COALESCE(f.flight_id, f.icao24 || '_' || f.first_seen)
                    AND f.origin_airport = dl.origin
                    AND f.destination_airport = dl.destination
+                   AND f.date = dl.date
                LEFT JOIN weather_cache w
-                 ON w.timestamp LIKE f.date || '%' || printf('%02d',
-                   CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
+                 ON w.timestamp = f.date || 'T' || printf('%02d:00',
+                    CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
                WHERE f.duration_min IS NOT NULL""",
             conn,
         )
@@ -737,8 +762,8 @@ def get_filtered_feature_table(
                    AND f.destination_airport = dl.destination
                    AND f.date = dl.date
                LEFT JOIN weather_cache w
-                 ON w.timestamp LIKE f.date || '%' || printf('%02d',
-                   CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
+                 ON w.timestamp = f.date || 'T' || printf('%02d:00',
+                    CAST((CAST(f.first_seen AS INTEGER) % 86400) / 3600 AS INTEGER))
                WHERE f.duration_min IS NOT NULL
                  AND f.callsign IN ({placeholders})""",
             conn,

@@ -200,6 +200,8 @@ def train_model(
         y_te_reg_pred = reg.predict(X_te)
 
         n_delayed_te = int(y_te_clf.sum())
+        n_clean_te = int(len(y_te_clf) - y_te_clf.sum())
+        has_both_classes = n_delayed_te > 0 and n_clean_te > 0
         clf_m = {
             "accuracy": accuracy_score(y_te_clf, y_te_pred),
             "balanced_accuracy": balanced_accuracy_score(y_te_clf, y_te_pred),
@@ -208,9 +210,9 @@ def train_model(
             "f1": f1_score(y_te_clf, y_te_pred, zero_division=0),
             "mcc": matthews_corrcoef(y_te_clf, y_te_pred),
             "kappa": cohen_kappa_score(y_te_clf, y_te_pred),
-            "roc_auc": roc_auc_score(y_te_clf, y_te_proba) if n_delayed_te > 0 else None,
-            "pr_auc": average_precision_score(y_te_clf, y_te_proba) if n_delayed_te > 0 else None,
-            "log_loss": log_loss(y_te_clf, y_te_proba),
+            "roc_auc": roc_auc_score(y_te_clf, y_te_proba) if has_both_classes else None,
+            "pr_auc": average_precision_score(y_te_clf, y_te_proba) if has_both_classes else None,
+            "log_loss": log_loss(y_te_clf, y_te_proba, labels=[0, 1]) if has_both_classes else None,
             "confusion": confusion_matrix(y_te_clf, y_te_pred).tolist(),
             "samples": len(y_te_clf),
             "delayed_in_test": n_delayed_te,
@@ -228,7 +230,11 @@ def train_model(
         if not dicts:
             return {}
         if keys is None:
-            keys = [k for k in dicts[0] if isinstance(dicts[0][k], (int, float)) and dicts[0][k] is not None]
+            keys = []
+            for d in dicts:
+                for k, v in d.items():
+                    if isinstance(v, (int, float)) and v is not None and k not in keys:
+                        keys.append(k)
         result = {}
         for k in keys:
             vals = [d[k] for d in dicts if k in d and d[k] is not None]
@@ -318,7 +324,7 @@ def train_model(
         "cv_kappa": round(avg_clf.get("kappa", 0), 4),
         "cv_roc_auc": round(cv_auc, 4) if cv_auc is not None else None,
         "cv_pr_auc": round(avg_clf.get("pr_auc", 0), 4) if avg_clf.get("pr_auc") is not None else None,
-        "cv_log_loss": round(avg_clf.get("log_loss", 0), 4),
+        "cv_log_loss": round(avg_clf.get("log_loss", 0), 4) if avg_clf.get("log_loss") is not None else None,
         "fold_accuracy": [round(a, 4) for a in fold_clf_accs],
         "fold_f1": [round(f, 4) for f in fold_clf_f1s],
         "fold_roc_auc": [round(a, 4) for a in fold_clf_aucs],
