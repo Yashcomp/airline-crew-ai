@@ -8,7 +8,7 @@ import statistics
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -17,6 +17,7 @@ from data.weather_client import (
     bulk_cache_weather, get_current_weather, get_weather_at_time,
     get_historical_weather, get_forecast_weather, _cache_weather,
     _get_cached_weather, init_weather_table, kmh_to_knots,
+    get_daily_weather, is_adverse_weather, weather_summary,
 )
 
 
@@ -154,6 +155,7 @@ def init_opensky_tables(db_path: Optional[Path] = None) -> None:
             delay_probability REAL,
             expected_delay_min REAL,
             risk_level TEXT,
+            predicted_delayed INTEGER,
             actual_delay_min REAL,
             actual_is_delayed INTEGER,
             actual_recorded_at TEXT,
@@ -183,6 +185,22 @@ def init_opensky_tables(db_path: Optional[Path] = None) -> None:
         conn.execute("ALTER TABLE prediction_cache ADD COLUMN weekday_weight REAL")
         conn.commit()
     except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE prediction_log ADD COLUMN predicted_delayed INTEGER")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        threshold = _get_optimal_threshold()
+        conn.execute(
+            """UPDATE prediction_log
+               SET predicted_delayed = CASE WHEN delay_probability >= ? THEN 1 ELSE 0 END
+               WHERE predicted_delayed IS NULL""",
+            (threshold,),
+        )
+        conn.commit()
+    except Exception:
         pass
     conn.close()
     init_weather_table(db_path)
@@ -1349,7 +1367,16 @@ def get_model_flights_with_status(
 
 
 def _get_optimal_threshold() -> float:
-    return 0.30
+    """Binary 'predicted delayed' threshold, delegated to the model metadata.
+
+    Single source of truth lives in ml_engine.delay_predictor.get_prediction_threshold
+    (F1-optimal threshold fit at training time; 0.30 fallback when no model).
+    """
+    try:
+        from ml_engine.delay_predictor import get_prediction_threshold
+        return float(get_prediction_threshold())
+    except Exception:
+        return 0.30
 
 
 def _get_cached_prediction(
@@ -1357,6 +1384,7 @@ def _get_cached_prediction(
     date: str,
     weekday_weight: Optional[float] = None,
     db_path: Optional[Path] = None,
+    max_age_hours: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     path = db_path or DEFAULT_DB_PATH
     if not path.exists():
@@ -1365,7 +1393,7 @@ def _get_cached_prediction(
         conn = _connect(path)
         try:
             row = conn.execute(
-                "SELECT delay_probability, expected_delay_min, risk_level, factors, model_used, weekday_weight "
+                "SELECT delay_probability, expected_delay_min, risk_level, factors, model_used, weekday_weight, created_at "
                 "FROM prediction_cache WHERE callsign = ? AND date = ?",
                 (callsign, date),
             ).fetchone()
@@ -1378,16 +1406,30 @@ def _get_cached_prediction(
     if weekday_weight is not None:
         if row["weekday_weight"] is None or abs(row["weekday_weight"] - weekday_weight) > 0.001:
             return None
+    if max_age_hours is not None:
+        created = row["created_at"]
+        if created:
+            try:
+                created_dt = datetime.fromisoformat(created)
+                if datetime.now(timezone.utc) - created_dt > timedelta(hours=max_age_hours):
+                    return None
+            except Exception:
+                return None
     try:
         factors = json.loads(row["factors"]) if row["factors"] else []
     except Exception:
         factors = []
-    threshold = _get_optimal_threshold()
-    prob = row["delay_probability"]
+    try:
+        prob = row["delay_probability"]
+        threshold = _get_optimal_threshold()
+    except Exception:
+        prob = 0.0
+        threshold = 0.30
+    risk = row["risk_level"] or ("Medium" if prob >= threshold else "Low")
     return {
         "delay_probability": prob,
         "expected_delay_min": row["expected_delay_min"],
-        "risk_level": row["risk_level"],
+        "risk_level": risk,
         "factors": factors,
         "model_used": row["model_used"],
         "predicted_delayed": bool(prob >= threshold),
@@ -1434,143 +1476,14 @@ def _save_cached_prediction(
 def get_today_schedule(
     db_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
-    from ml_engine.delay_predictor import predict_delay, _load_models, WEEKDAY_WEIGHT_DEFAULT
+    """Today's full schedule with fresh predictions.
 
-    path = db_path or DEFAULT_DB_PATH
-    now = datetime.now(timezone.utc)
-    window_end = now + timedelta(hours=24)
-    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=path, day_of_week=now.weekday())
-
-    _load_models()
-
-    cached_weather: Dict[str, Dict] = {}
-    today_str = now.strftime("%Y-%m-%d")
-    horizon_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    def _index_weather(records) -> None:
-        for r in records:
-            ts = r.get("timestamp", "")
-            if isinstance(ts, str):
-                for h in range(24):
-                    if f"T{h:02d}" in ts:
-                        cached_weather[f"{ts[:10]}-{h:02d}"] = r
-                        break
-
-    try:
-        existing = _get_cached_weather(today_str, path)
-        if existing:
-            _index_weather([dict(r) for r in existing])
-        else:
-            records = get_forecast_weather(today_str, today_str)
-            if records:
-                _cache_weather(records, path)
-                _index_weather(records)
-        tomorrow_records = get_forecast_weather(horizon_str, horizon_str)
-        if tomorrow_records:
-            _cache_weather(tomorrow_records, path)
-            _index_weather(tomorrow_records)
-    except Exception:
-        pass
-
-    kept: List[Dict[str, Any]] = []
-    for flight in schedule:
-        dep_hour = flight["avg_departure_hour"]
-        dep_minute = flight["avg_departure_minute"]
-        duration = flight["avg_duration_min"]
-        is_return = flight.get("is_return_leg", False)
-        fid = flight["callsign"]
-
-        scheduled_dep = now.replace(hour=dep_hour, minute=dep_minute, second=0, microsecond=0)
-        if scheduled_dep < now:
-            scheduled_dep += timedelta(days=1)
-        if scheduled_dep > window_end:
-            continue
-        scheduled_arr = scheduled_dep + timedelta(minutes=duration)
-        dep_date_str = scheduled_dep.strftime("%Y-%m-%d")
-
-        weather_key = scheduled_dep.strftime("%Y-%m-%d-%H")
-        weather = cached_weather.get(weather_key, {})
-        if not weather:
-            try:
-                weather = get_weather_at_time(scheduled_dep)
-            except Exception:
-                pass
-
-        cached_pred = _get_cached_prediction(fid, dep_date_str, WEEKDAY_WEIGHT_DEFAULT, path)
-        if cached_pred:
-            pred = cached_pred
-        else:
-            rates = get_delay_rates(
-                callsign=fid, origin=flight["origin"], destination=flight["destination"],
-                dep_hour=dep_hour, target_date=dep_date_str, db_path=path,
-            )
-            pred = predict_delay(
-                origin=flight["origin"],
-                destination=flight["destination"],
-                departure_hour=dep_hour,
-                departure_time=scheduled_dep,
-                wind_speed_kmh=weather.get("wind_speed_kmh") or 0,
-                wind_gusts_kmh=weather.get("wind_gusts_kmh") or 0,
-                visibility_m=weather.get("visibility_m") or 10000,
-                cloud_cover_pct=weather.get("cloud_cover_pct") or 0,
-                precipitation_mm=weather.get("precipitation_mm") or 0,
-                temperature_c=weather.get("temperature_c") or 25,
-                pressure_hpa=weather.get("pressure_hpa") or 1013,
-                delay_rate_pct=flight.get("delay_rate_pct"),
-                dow_delay_rate=flight.get("dow_delay_rate"),
-                overall_delay_rate=flight.get("overall_delay_rate"),
-                dow_sample_count=flight.get("dow_sample_count"),
-                expected_duration_min=rates.get("expected_duration_min", 0),
-                route_hour_delay_rate=rates.get("route_hour_delay_rate", 0),
-                route_delay_rate=rates.get("route_delay_rate", 0),
-                callsign_delay_rate=rates.get("callsign_delay_rate", 0),
-            )
-            _save_cached_prediction(
-                fid, dep_date_str,
-                origin=flight["origin"], destination=flight["destination"],
-                departure_hour=dep_hour, pred=pred,
-                weekday_weight=WEEKDAY_WEIGHT_DEFAULT, db_path=path,
-            )
-
-        flight["scheduled_date"] = dep_date_str
-        flight["scheduled_departure_dt"] = scheduled_dep
-        flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
-        flight["scheduled_arrival"] = scheduled_arr.strftime("%H:%M")
-        flight["weather"] = {
-            "temp_c": weather.get("temperature_c", "N/A"),
-            "wind_kmh": weather.get("wind_speed_kmh", "N/A"),
-            "visibility_m": weather.get("visibility_m", "N/A"),
-            "precipitation_mm": weather.get("precipitation_mm", 0),
-        }
-        flight["prediction"] = {
-            "delay_probability": pred["delay_probability"],
-            "expected_delay_min": pred["expected_delay_min"],
-            "risk_level": pred["risk_level"],
-            "factors": pred.get("factors", []),
-            "model_used": pred["model_used"],
-            "predicted_delayed": pred.get("predicted_delayed", bool(pred["delay_probability"] >= _get_optimal_threshold())),
-        }
-
-        if is_return:
-            flight["leg_type"] = "Return Leg"
-            prev_delay = flight.get("prev_flight_delay_min") or 0
-            turnaround_min = 45 + prev_delay
-            flight["layover_turnaround_min"] = int(turnaround_min)
-            flight["crew_action"] = (
-                f"Layover crew change needed after arrival at {scheduled_arr.strftime('%H:%M')} UTC "
-                f"({int(turnaround_min)}min turnaround) — fresh crew must board before next departure"
-            )
-        else:
-            flight["leg_type"] = "First Leg"
-            flight["layover_turnaround_min"] = None
-            flight["crew_action"] = (
-                f"Pre-departure crew assignment required before {scheduled_dep.strftime('%H:%M')} UTC"
-            )
-
-        kept.append(flight)
-
-    kept.sort(key=lambda f: f["scheduled_departure_dt"])
-    return kept
+    Delegates to :func:`get_schedule_for_date` for the current UTC date so the
+    Daily Briefing (Forecasting tab) always matches the Planning tab for the
+    same day exactly (same flight set, weather, and prediction inputs).
+    """
+    today = datetime.now(timezone.utc).date()
+    return get_schedule_for_date(today, db_path=db_path)
 
 
 def get_delay_rates(
@@ -1654,7 +1567,18 @@ def get_delay_rates(
 def get_schedule_for_date(
     target_date,
     db_path: Optional[Path] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
+    """Scheduled flights + delay predictions for a fixed calendar date.
+
+    Weather is served from the DB cache when available (no network); otherwise
+    it is fetched from Open-Meteo once and stored. Predictions are reused from
+    ``prediction_cache`` when the weather inputs came from cache (deterministic),
+    and recomputed + re-stored whenever weather was freshly fetched.
+
+    ``progress`` is an optional callback invoked with a short status string as
+    each stage completes (used by the UI for live progress).
+    """
     from ml_engine.delay_predictor import predict_delay, _load_models
 
     if isinstance(target_date, str):
@@ -1669,23 +1593,36 @@ def get_schedule_for_date(
 
     cached_weather: Dict[str, Dict] = {}
     dt_str = dt.strftime("%Y-%m-%d")
+    weather_from_cache = False
+    _t_start = time.time()
+
+    def _log(stage: str, msg: str) -> None:
+        print(f"[schedule] {stage}: {msg} ({time.time() - _t_start:.1f}s)", flush=True)
+
+    if progress:
+        progress(f"Loading flight schedule for {dt_str}")
     try:
-        records = get_historical_weather(dt_str, dt_str)
-        if not records:
-            records = get_forecast_weather(dt_str, dt_str)
+        records = _get_cached_weather(dt_str, db_path)
         if records:
-            _cache_weather(records)
-            for r in records:
-                ts = r.get("timestamp", "")
-                if isinstance(ts, str):
-                    for h in range(24):
-                        if f"T{h:02d}" in ts:
-                            cached_weather[f"{dt_str}-{h:02d}"] = r
-                            break
+            weather_from_cache = True
+            _log("weather", f"{dt_str}: DB cache hit ({len(records)} hourly records)")
+        else:
+            records = get_daily_weather(dt, db_path=db_path)
+            weather_from_cache = False
+            _log("weather", f"{dt_str}: fetched {len(records)} hourly records from Open-Meteo")
+        for r in records:
+            ts = r.get("timestamp", "")
+            if isinstance(ts, str):
+                for h in range(24):
+                    if f"T{h:02d}" in ts:
+                        cached_weather[f"{dt_str}-{h:02d}"] = r
+                        break
     except Exception:
         pass
 
-    for flight in schedule:
+    n_flights = len(schedule)
+    for i, flight in enumerate(schedule):
+        callsign = flight.get("callsign", "")
         dep_hour = flight["avg_departure_hour"]
         dep_minute = flight["avg_departure_minute"]
         duration = flight["avg_duration_min"]
@@ -1702,33 +1639,56 @@ def get_schedule_for_date(
             except Exception:
                 pass
 
-        rates = get_delay_rates(
-            callsign=flight.get("callsign"), origin=flight["origin"],
-            destination=flight["destination"], dep_hour=dep_hour,
-            target_date=dt.strftime("%Y-%m-%d"), db_path=db_path,
-        )
-        pred = predict_delay(
-            origin=flight["origin"],
-            destination=flight["destination"],
-            departure_hour=dep_hour,
-            departure_time=scheduled_dep,
-            wind_speed_kmh=weather.get("wind_speed_kmh") or 0,
-            wind_gusts_kmh=weather.get("wind_gusts_kmh") or 0,
-            visibility_m=weather.get("visibility_m") or 10000,
-            cloud_cover_pct=weather.get("cloud_cover_pct") or 0,
-            precipitation_mm=weather.get("precipitation_mm") or 0,
-            temperature_c=weather.get("temperature_c") or 25,
-            pressure_hpa=weather.get("pressure_hpa") or 1013,
-            delay_rate_pct=flight.get("delay_rate_pct"),
-            dow_delay_rate=flight.get("dow_delay_rate"),
-            overall_delay_rate=flight.get("overall_delay_rate"),
-            dow_sample_count=flight.get("dow_sample_count"),
-            expected_duration_min=rates.get("expected_duration_min", 0),
-            route_hour_delay_rate=rates.get("route_hour_delay_rate", 0),
-            route_delay_rate=rates.get("route_delay_rate", 0),
-            callsign_delay_rate=rates.get("callsign_delay_rate", 0),
-        )
+        if progress:
+            progress(f"Predicting {i+1}/{n_flights} {callsign} ({flight['origin']}->{flight['destination']})")
+        _t_flight = time.time()
 
+        cached_pred = None
+        if weather_from_cache:
+            cached_pred = _get_cached_prediction(callsign, dt_str, db_path=db_path, max_age_hours=12)
+        if cached_pred:
+            pred = cached_pred
+        else:
+            rates = get_delay_rates(
+                callsign=callsign, origin=flight["origin"],
+                destination=flight["destination"], dep_hour=dep_hour,
+                target_date=dt_str, db_path=db_path,
+            )
+            pred = predict_delay(
+                origin=flight["origin"],
+                destination=flight["destination"],
+                departure_hour=dep_hour,
+                departure_time=scheduled_dep,
+                wind_speed_kmh=weather.get("wind_speed_kmh") or 0,
+                wind_gusts_kmh=weather.get("wind_gusts_kmh") or 0,
+                visibility_m=weather.get("visibility_m") or 10000,
+                cloud_cover_pct=weather.get("cloud_cover_pct") or 0,
+                precipitation_mm=weather.get("precipitation_mm") or 0,
+                temperature_c=weather.get("temperature_c") or 25,
+                pressure_hpa=weather.get("pressure_hpa") or 1013,
+                delay_rate_pct=flight.get("delay_rate_pct"),
+                dow_delay_rate=flight.get("dow_delay_rate"),
+                overall_delay_rate=flight.get("overall_delay_rate"),
+                dow_sample_count=flight.get("dow_sample_count"),
+                expected_duration_min=rates.get("expected_duration_min", 0),
+                route_hour_delay_rate=rates.get("route_hour_delay_rate", 0),
+                route_delay_rate=rates.get("route_delay_rate", 0),
+                callsign_delay_rate=rates.get("callsign_delay_rate", 0),
+            )
+            if weather_from_cache:
+                try:
+                    _save_cached_prediction(
+                        callsign, dt_str, flight["origin"], flight["destination"],
+                        dep_hour, pred, db_path=db_path,
+                    )
+                except Exception:
+                    pass
+        _log("flight", f"{i+1}/{n_flights} {callsign} {flight['origin']}->{flight['destination']} "
+                       f"{pred['risk_level']} prob={pred['delay_probability']} "
+                       f"delay={pred['expected_delay_min']}min ({time.time() - _t_flight:.2f}s)")
+
+        flight["scheduled_date"] = dt_str
+        flight["scheduled_departure_dt"] = scheduled_dep
         flight["scheduled_departure"] = scheduled_dep.strftime("%H:%M")
         flight["scheduled_arrival"] = scheduled_arr.strftime("%H:%M")
         flight["weather"] = {
@@ -1762,6 +1722,7 @@ def get_schedule_for_date(
                 f"Pre-departure crew assignment required before {scheduled_dep.strftime('%H:%M')} UTC"
             )
 
+    _log("done", f"predicted {n_flights} flights in {time.time() - _t_start:.1f}s total")
     return schedule
 
 
@@ -1868,6 +1829,7 @@ def get_flight_actuals_for_date(
     path = db_path or DEFAULT_DB_PATH
     if not path.exists():
         return []
+    init_opensky_tables(path)
     conn = _connect(path)
     try:
         rows = conn.execute(
@@ -1890,6 +1852,7 @@ def get_flight_actuals_for_date(
                 pl.delay_probability,
                 pl.expected_delay_min AS predicted_delay_min,
                 pl.risk_level AS predicted_risk,
+                pl.predicted_delayed AS predicted_delayed,
                 pl.actual_delay_min,
                 pl.actual_is_delayed
             FROM flights fl
@@ -1929,6 +1892,7 @@ def get_flight_actuals_for_date(
                      dl.expected_duration_min, dl.actual_duration_min,
                      dl.deviation_min, dl.is_delayed,
                      pl.delay_probability, pl.expected_delay_min, pl.risk_level,
+                     pl.predicted_delayed,
                      pl.actual_delay_min, pl.actual_is_delayed
             ORDER BY fl.std
             """,
@@ -1938,6 +1902,31 @@ def get_flight_actuals_for_date(
         rows = []
     finally:
         conn.close()
+
+    weather_map = {}
+    for d_off in (0, 1, -1):
+        d_str = (target_date + timedelta(days=d_off)).strftime("%Y-%m-%d")
+        for rec in _get_cached_weather(d_str, db_path):
+            ts = rec.get("timestamp")
+            if ts and "T" in str(ts):
+                weather_map[str(ts)[:13]] = rec
+    if not weather_map:
+        for rec in get_daily_weather(target_date, db_path=db_path):
+            ts = rec.get("timestamp")
+            if ts and "T" in str(ts):
+                weather_map[str(ts)[:13]] = rec
+
+    def _wx_for(utc_epoch, sch_hour=None, sch_minute=0):
+        if utc_epoch is not None:
+            local_dt = datetime.fromtimestamp(utc_epoch, timezone.utc) + timedelta(hours=5, minutes=30)
+            return weather_map.get(local_dt.strftime("%Y-%m-%dT%H"))
+        if sch_hour is not None:
+            dep_utc = datetime(
+                target_date.year, target_date.month, target_date.day,
+                sch_hour, sch_minute, tzinfo=timezone.utc,
+            ) + timedelta(hours=5, minutes=30)
+            return weather_map.get(dep_utc.strftime("%Y-%m-%dT%H"))
+        return None
 
     actuals = []
     for r in rows:
@@ -1960,12 +1949,33 @@ def get_flight_actuals_for_date(
         if r["last_seen"] is not None:
             actual_arr = datetime.fromtimestamp(r["last_seen"], timezone.utc).strftime("%H:%M")
         has_actual = r["first_seen"] is not None and r["expected_duration_min"] is not None
-        if r["is_delayed"] is not None:
-            status = "Delayed" if r["is_delayed"] else "On time"
-        elif not has_actual:
+
+        arrival_dev_min = None
+        if hour is not None and r["last_seen"] is not None:
+            scheduled_dep_min = hour_int * 60 + minute
+            scheduled_arr_min = scheduled_dep_min + (expected_min if expected_min else 0)
+            actual_arr_min = (int(r["last_seen"]) % 86400) / 60.0
+            d = actual_arr_min - scheduled_arr_min
+            if d >= 720:
+                d -= 1440
+            elif d < -720:
+                d += 1440
+            arrival_dev_min = round(d, 1)
+
+        if not has_actual:
             status = "No data"
-        else:
+        elif arrival_dev_min is None:
             status = "On time"
+        else:
+            status = "Delayed" if arrival_dev_min > 15.0 else "On time"
+
+        dep_wx = _wx_for(r["first_seen"])
+        if dep_wx is None and hour is not None:
+            dep_wx = _wx_for(None, sch_hour=hour_int, sch_minute=minute)
+        arr_wx = _wx_for(r["last_seen"])
+        wx_adverse = bool(is_adverse_weather(dep_wx) or is_adverse_weather(arr_wx))
+        wx_label = weather_summary(dep_wx or arr_wx)
+
         actuals.append({
             "callsign": r["callsign"],
             "route": f"{r['origin']}→{r['destination']}",
@@ -1977,11 +1987,15 @@ def get_flight_actuals_for_date(
             "expected_flight_min": r["expected_duration_min"],
             "actual_flight_min": r["actual_duration_min"],
             "deviation_min": round(r["deviation_min"], 1) if r["deviation_min"] is not None else None,
+            "arrival_deviation_min": arrival_dev_min,
             "status": status,
+            "weather": wx_label,
+            "wx_adverse": wx_adverse,
             "has_actual": has_actual,
             "predicted_prob": r["delay_probability"],
             "predicted_delay_min": r["predicted_delay_min"],
             "predicted_risk": r["predicted_risk"],
+            "predicted_delayed": r["predicted_delayed"],
             "actual_delay_min": r["actual_delay_min"],
             "actual_is_delayed": r["actual_is_delayed"],
         })
@@ -2127,11 +2141,12 @@ def log_predictions(
                     conn.execute(
                         """INSERT OR REPLACE INTO prediction_log
                         (callsign, origin, destination, date, predicted_at,
-                         delay_probability, expected_delay_min, risk_level)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                         delay_probability, expected_delay_min, risk_level, predicted_delayed)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             f["callsign"], f["origin"], f["destination"], flight_date, now_iso,
                             pred["delay_probability"], pred["expected_delay_min"], pred["risk_level"],
+                            int(bool(pred.get("predicted_delayed", False))),
                         ),
                     )
                     count += 1
@@ -2412,11 +2427,13 @@ def get_prediction_audit(days: int = 14, db_path: Optional[Path] = None) -> pd.D
     path = db_path or DEFAULT_DB_PATH
     if not path.exists():
         return pd.DataFrame()
+    init_opensky_tables(path)
     conn = _connect(path)
     try:
         df = pd.read_sql_query(
             """SELECT callsign, origin, destination, date, predicted_at,
                       delay_probability, expected_delay_min, risk_level,
+                      predicted_delayed,
                       actual_delay_min, actual_is_delayed
                FROM prediction_log
                WHERE actual_is_delayed IS NOT NULL
@@ -2437,8 +2454,11 @@ def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
         return {"total": 0, "message": "No audit data available."}
 
     audit_df = audit_df.copy()
-    threshold = 0.30
-    audit_df["predicted_delayed"] = audit_df["risk_level"].isin(["High", "Medium"])
+    threshold = _get_optimal_threshold()
+    if "predicted_delayed" in audit_df.columns:
+        audit_df["predicted_delayed"] = audit_df["predicted_delayed"].fillna(0).astype(bool)
+    else:
+        audit_df["predicted_delayed"] = audit_df["delay_probability"] >= threshold
 
     total = len(audit_df)
     predicted_high_med = audit_df["predicted_delayed"]
@@ -2508,5 +2528,6 @@ def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
         "calibration": calibration,
         "risk_distribution": risk_dist,
         "predictions": audit_df[["date", "callsign", "origin", "destination", "delay_probability",
-                                  "risk_level", "actual_delay_min", "actual_is_delayed", "match"]].to_dict("records"),
+                                  "risk_level", "predicted_delayed", "actual_delay_min",
+                                  "actual_is_delayed", "match"]].to_dict("records"),
     }

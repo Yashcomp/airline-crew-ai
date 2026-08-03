@@ -28,6 +28,17 @@ RULE_KEYWORDS = (
     "flying hour", "flight time limit", "minimum rest",
 )
 
+META_QUESTION_PATTERNS = (
+    r"\bare\s+you\s+(?:aware\s+of|familiar\s+with|knowledgeable\s+about)\b",
+    r"\bdo\s+you\s+know\s+(?:about|anything\s+about)\b",
+    r"\bwhat\s+do\s+you\s+know\s+about\b",
+    r"\bwhat\s+(?:rules|guidelines|regulations)\s+do\s+you\s+(?:know|follow|apply|use)\b",
+    r"\btell\s+me\s+about\s+(?:the\s+)?(?:dgca|fdtl|rules|guidelines|regulations)\b",
+    r"\bwhat\s+(?:is|are)\s+(?:the\s+)?(?:dgca|fdtl|guidelines)\b",
+    r"\bhow\s+many\s+(?:rules|guidelines|regulations)\s+do\s+you\s+(?:know|have|follow)\b",
+    r"\b(?:what|which)\s+(?:guidelines|rules)\s+(?:apply|cover)\b",
+)
+
 FLIGHT_KEYWORDS = (
     "flight", "departure", "departure", "arrive", "arriving",
     "schedule", "delay", "cancelled", "gate", "terminal",
@@ -195,11 +206,20 @@ def _is_plain_greeting(user_input: str) -> bool:
     return True
 
 
+def is_meta_question(user_input: str) -> bool:
+    return any(re.search(p, user_input, re.IGNORECASE) for p in META_QUESTION_PATTERNS)
+
+
 def _classify_with_regex(user_input: str) -> RouteDecision:
     if _is_plain_greeting(user_input):
         return RouteDecision(
             intent="General_Chat", route="chat",
             confidence=0.9, mode="regex_fallback", raw_input=user_input,
+        )
+    if is_meta_question(user_input):
+        return RouteDecision(
+            intent="General_Chat", route="chat",
+            confidence=0.85, mode="regex_fallback", raw_input=user_input,
         )
     if _contains_any(user_input, RULE_KEYWORDS):
         return RouteDecision(

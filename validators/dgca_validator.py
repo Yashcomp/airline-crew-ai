@@ -51,6 +51,17 @@ MAX_CONSECUTIVE_DAYS_ON: Dict[Role, int] = {
 for _r in GROUND_ROLES:
     MAX_CONSECUTIVE_DAYS_ON[_r] = 6
 
+
+def scenario_hours_for_role(role: Role, flight_hours: float) -> float:
+    """Flight-block duration only applies to airborne roles.
+
+    Ground staff work turnaround only, so flight duration must not project
+    against their duty/rolling caps; their assignment is governed by shift
+    compatibility instead.
+    """
+    return flight_hours if role not in GROUND_ROLES else 0.0
+
+
 STANDARD_DUTY_THRESHOLD: Dict[Role, float] = {
     Role.CAPTAIN: 10.0,
     Role.FO: 10.0,

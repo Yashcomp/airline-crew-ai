@@ -351,6 +351,60 @@ def _build_llm():
         return DummyLLM(), "dummy"
 
 
+def _build_groq_llm():
+    try:
+        from langchain_openai import ChatOpenAI
+        from config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
+    except ImportError:
+        return None
+    if not GROQ_API_KEY or GROQ_API_KEY == "your-groq-api-key-here":
+        return None
+    try:
+        return ChatOpenAI(
+            model=GROQ_MODEL,
+            api_key=GROQ_API_KEY,
+            base_url=GROQ_BASE_URL,
+            temperature=0.1,
+            request_timeout=20,
+        )
+    except Exception:
+        return None
+
+
+def _synthesize_answer(query: str, context: str, sources: List[str]) -> Optional[str]:
+    llm = _build_groq_llm()
+    if llm is None:
+        return None
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+    except ImportError:
+        return None
+    source_line = ", ".join(dict.fromkeys(sources[:3]))
+    prompt = (
+        "Answer the user's question in plain English, directly and conversationally. "
+        "Base your answer only on the retrieved DGCA guidance below. "
+        "If the guidance does not actually answer the question, say so honestly "
+        "instead of guessing. Keep it concise (3-6 sentences).\n\n"
+        f"QUESTION: {query}\n\n"
+        "RETRIEVED GUIDANCE:\n"
+        f"{context}\n"
+    )
+    try:
+        response = llm.invoke([
+            SystemMessage(content="You are an airline compliance assistant for Bangalore (VOBL) airport. "
+                                  "Answer DGCA rule questions accurately using only the provided guidance, in plain English."),
+            HumanMessage(content=prompt),
+        ])
+        answer = str(response.content).strip()
+    except Exception:
+        return None
+    if not answer:
+        return None
+    if source_line:
+        answer = f"{answer}\n\nSource: {source_line}"
+    return answer
+
+
 def _get_sentence_transformer():
     try:
         from sentence_transformers import SentenceTransformer
@@ -647,6 +701,10 @@ def retrieve_legal_guidance(
     context, sources = _format_context(relevant_docs)
     if not context:
         return DummyLLM().synthesize(query, "")
+
+    synthesized = _synthesize_answer(query, context, sources)
+    if synthesized:
+        return synthesized
 
     return _extractive_answer(query, context, sources)
 

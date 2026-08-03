@@ -12,7 +12,7 @@ from data.flights_db import (
     is_crew_assigned, get_standby_crew, get_flight, get_all_assignments,
 )
 from data.models import CrewMember, Flight, Role
-from validators.dgca_validator import check_crew_eligibility, GROUND_ROLES
+from validators.dgca_validator import check_crew_eligibility, GROUND_ROLES, scenario_hours_for_role
 
 
 def _get_shift_for_hour(hour: int) -> str:
@@ -72,7 +72,7 @@ def auto_assign_flight(
             eligible = check_crew_eligibility(
                 member,
                 flights=[flight],
-                scenario_flight_hours=flight.flight_hours,
+                scenario_flight_hours=scenario_hours_for_role(member.role, flight.flight_hours),
                 scenario_is_night_duty=flight.is_night_duty,
             )
             if not eligible.eligible:

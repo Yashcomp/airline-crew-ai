@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from rag_engine import retrieve_legal_guidance
-from router import route_request, _is_plain_greeting, _extract_date
+from router import route_request, _is_plain_greeting, is_meta_question, _extract_date
 from solver import solve_from_csv, solve_multi_flight
 from data.flights_db import (
     init_db, get_flights, get_flight,
@@ -24,12 +24,11 @@ from agents.flight_agent import answer_flight_query, answer_crew_query
 from agents.compliance_agent import validate_single_crew, get_at_risk_crew
 from ml_engine.resource_augmenter import forecast_crew_needs
 from data.delay_handler import process_delay, process_cancellation, find_replacement_crew
-from data.delay_handler import analyze_delay_impact, proactive_crew_assignment
+from data.delay_handler import analyze_delay_impact, proactive_crew_assignment, assess_replacement_coverage
 from data.opensky_db import (
     poll_live_data, get_today_schedule, get_schedule_for_date, update_daily_data,
     get_model_flights_with_status, sync_opensky_flights_to_db,
     log_predictions, update_actuals, get_last_briefing_time,
-    get_prediction_audit, compute_audit_metrics,
     get_flight_actuals_for_date, get_data_date_range,
     get_delayed_flights_for_date,
 )
@@ -552,7 +551,7 @@ with tab_chat:
                 decision = route_request(prompt)
                 intent = decision.get("intent", "Data_Query")
 
-                if intent in ("Rule_Query", "Data_Query", "Flight_Status", "Planning_Query") and _is_plain_greeting(prompt):
+                if intent in ("Rule_Query", "Data_Query", "Flight_Status", "Planning_Query") and (_is_plain_greeting(prompt) or is_meta_question(prompt)):
                     decision["intent"] = "General_Chat"
                     decision["route"] = "chat"
                     decision["extraction"] = {}
@@ -723,7 +722,102 @@ with tab_chat:
                     crew_keywords = ("crew", "staff", "who", "can fly", "eligible", "available", "roster", "information about")
                     has_crew_keyword = any(kw in prompt.lower() for kw in crew_keywords)
 
-                    if not all_fids and has_crew_keyword:
+                    coverage_keywords = ("sufficient", "enough", "replacement", "replace", "cover", "coverage", "covered", "backfill", "backup crew", "all of them", "standby crew for")
+                    has_coverage_intent = has_crew_keyword and any(kw in prompt.lower() for kw in coverage_keywords)
+
+                    if has_coverage_intent:
+                        delay_m = re.search(r"(\d+)\s*(minutes?|mins?|hrs?|hours?)?\s*(?:delay|delayed|late)", prompt, re.IGNORECASE)
+                        if delay_m is None:
+                            delay_m = re.search(r"(?:delay(?:ed)?|late)\s+(?:by\s+)?(\d+)\s*(minutes?|mins?|hrs?|hours?)?", prompt, re.IGNORECASE)
+                        delay_minutes = None
+                        if delay_m:
+                            num = int(delay_m.group(1))
+                            unit = (delay_m.group(2) or "").lower()
+                            delay_minutes = num * 60 if unit.startswith(("h", "hr", "ho")) else num
+
+                        if all_fids:
+                            cov_fids = [f.upper().replace("_", "-") for f in all_fids]
+                            flight_map = None
+                        else:
+                            ctx_date = _extract_date(prompt)
+                            if ctx_date:
+                                cov_fids = [
+                                    a["callsign"] for a in get_flight_actuals_for_date(ctx_date, db_path=DEFAULT_DB_PATH)
+                                    if a["status"] == "Delayed"
+                                ]
+                                flight_map = None
+                            else:
+                                today_flights = get_today_schedule(DEFAULT_DB_PATH)
+                                flight_map = {f["callsign"]: f for f in today_flights}
+                                cov_fids = [
+                                    f["callsign"] for f in today_flights
+                                    if f["prediction"]["risk_level"] in ("High", "Medium")
+                                ]
+                            if not cov_fids:
+                                for msg in reversed(st.session_state.messages):
+                                    found = re.findall(r"([A-Z]{2,3}[-_]?\d{2,4})", msg.get("content", ""), re.IGNORECASE)
+                                    if found:
+                                        cov_fids = [found[0].upper().replace("_", "-")]
+                                        break
+
+                        if not cov_fids:
+                            msg = ("I could not identify any flights to check. Mention specific flight IDs, "
+                                   "a date with delayed flights, or ask about today's risk flights.")
+                            st.markdown(msg)
+                            st.session_state.messages.append({
+                                "role": "assistant", "type": "data",
+                                "content": msg, "decision": decision,
+                            })
+                        else:
+                            with st.spinner(f"Checking replacement crew coverage for {len(cov_fids)} flight(s)..."):
+                                coverage = assess_replacement_coverage(
+                                    cov_fids, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH,
+                                    delay_minutes=delay_minutes, flight_map=flight_map,
+                                )
+
+                            if delay_minutes:
+                                msg = f"### Sufficient replacement crew for a +{delay_minutes} min delay?\n\n"
+                            else:
+                                msg = "### Is there sufficient replacement crew?\n\n"
+                            if coverage["all_sufficient"]:
+                                msg += ("**Verdict: Sufficient** — every flight can be fully re-crewed from the eligible "
+                                        "standby pool (no shared-crew conflicts across flights).\n\n")
+                            else:
+                                msg += ("**Verdict: Insufficient** — at least one flight cannot be fully covered "
+                                        "from the eligible standby pool.\n\n")
+
+                            msg += "| Flight | Route | Assigned | Eligible Standby | Coverage |\n"
+                            msg += "|--------|-------|----------|------------------|----------|\n"
+                            for f in coverage["flights"]:
+                                if "error" in f:
+                                    msg += f"| {f['flight_id']} | - | - | - | Error: {f['error']} |\n"
+                                    continue
+                                missing = [r for r, v in f["role_verdict"].items() if not v["sufficient"]]
+                                cov_txt = "OK" if f["sufficient"] else "Missing: " + ", ".join(missing)
+                                msg += f"| {f['flight_id']} | {f['route']} | {f['assigned_count']} | {f['eligible_standby_count']} | {cov_txt} |\n"
+                            msg += "\n"
+
+                            if coverage["shortfalls"]:
+                                msg += "**Shortfalls:** " + "; ".join(coverage["shortfalls"]) + "\n\n"
+
+                            if delay_minutes:
+                                msg += ("**Assumption:** 'eligible' = DGCA-legal to take this flight at a departure shifted "
+                                        f"+{delay_minutes} min (scenario duty includes the delay, night-duty flag from the "
+                                        "delayed hour, ground roles matched to the shifted shift).\n\n")
+                            else:
+                                msg += ("**Assumption:** coverage checked per role (Captain 1, FO 1, CabinCrew 4, "
+                                        "Ramp/Baggage/Cleaning/Check-in/Security 1 each) against the current legal standby "
+                                        "pool; one standby crew member cannot cover two flights.\n\n")
+
+                            st.markdown(msg)
+                            with st.expander("System Extraction & Audit Trail"):
+                                st.json(decision)
+                            st.session_state.messages.append({
+                                "role": "assistant", "type": "data",
+                                "content": msg, "decision": decision,
+                            })
+
+                    elif not all_fids and has_crew_keyword:
                         for msg in reversed(st.session_state.messages):
                             content = msg.get("content", "")
                             found = re.findall(r"([A-Z]{2,3}[-_]?\d{2,4})", content, re.IGNORECASE)
@@ -1087,6 +1181,14 @@ with tab_chat:
                 if (!bar) return;
                 bar.style.display = chatActive() ? "" : "none";
             }
+            function setTop() {
+                if (chatActive()) return;
+                try { parent.window.scrollTo(0, 0); } catch (e) {}
+                var el = doc.scrollingElement || doc.documentElement;
+                if (el) { try { el.scrollTop = 0; } catch (e) {} }
+                var view = doc.querySelector('[data-testid="stAppViewContainer"]');
+                if (view) { try { view.scrollTop = 0; } catch (e) {} }
+            }
             syncBar();
             setTimeout(syncBar, 250);
             if (doScroll && chatActive()) {
@@ -1094,10 +1196,19 @@ with tab_chat:
                 if (msgs.length) {
                     msgs[msgs.length - 1].scrollIntoView({ behavior: "smooth", block: "end" });
                 }
+            } else {
+                setTop();
+                requestAnimationFrame(setTop);
+                setTimeout(setTop, 150);
+                setTimeout(setTop, 400);
             }
             var tabs = doc.querySelector('[data-testid="stTabs"]');
             if (tabs) {
-                new MutationObserver(syncBar).observe(
+                function onTabChange() {
+                    syncBar();
+                    if (!chatActive()) { setTop(); }
+                }
+                new MutationObserver(onTabChange).observe(
                     tabs, { attributes: true, subtree: true, attributeFilter: ["aria-selected"] }
                 );
             }
@@ -1115,19 +1226,11 @@ with tab_ops:
     st.header("Crew")
     st.caption("Standby crew and flight-wise crew assignments.")
 
-    if st.button("Sync Flights & Assign Crew", help="Re-insert OpenSky flights and auto-assign crew from standby roster."):
-        with st.spinner("Syncing flights and assigning crew..."):
-            sync_result = sync_opensky_flights_to_db(
-                csv_path=str(DEFAULT_CSV_PATH), db_path=DEFAULT_DB_PATH
-            )
-        st.success(sync_result["message"])
-        st.rerun()
-
     flights = get_flights(db_path=DEFAULT_DB_PATH)
     crew = load_crew(DEFAULT_CSV_PATH)
 
     if not flights:
-        st.info("No flights in schedule. Click 'Sync Flights & Assign Crew' above to load OpenSky flights.")
+        st.info("No flights in schedule yet. Run **Daily Briefing** to load and crew the schedule.")
     elif not crew:
         st.warning("No crew data found.")
     else:
@@ -1211,7 +1314,7 @@ with tab_forecast:
     st.caption("Predict delays and suggest DGCA-compliant crew assignments using OpenSky data and ML models.")
 
     st.subheader("Daily Briefing — BLR Flights")
-    st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments. Shows the **next 24 hours** of flights (rolling from now), with each flight's date labeled. Predictions weight this weekday's delay history from previous weeks (recency-decayed).")
+    st.caption("One-click pipeline: seed latest data, predict delays, suggest DGCA-compliant crew assignments. Shows **today's full schedule** (calendar-day, matching the Planning tab for the same date). Predictions weight this weekday's delay history from previous weeks (recency-decayed).")
 
     if st.button("Run Daily Briefing", type="primary",
                  help="Seeds recent data, auto-trains the model if more than 24h since the last briefing, predicts delays, suggests crew."):
@@ -1232,6 +1335,10 @@ with tab_forecast:
                     retrain = False
             update_result = update_daily_data(days_back=days_back, db_path=DEFAULT_DB_PATH, retrain=retrain)
             t1 = time.perf_counter(); print(f"[perf] update_daily_data: {t1-t0:.2f}s")
+            sync_result = sync_opensky_flights_to_db(
+                csv_path=str(DEFAULT_CSV_PATH), db_path=DEFAULT_DB_PATH
+            )
+            t1b = time.perf_counter(); print(f"[perf] sync_opensky_flights_to_db: {t1b-t1:.2f}s")
             today_flights = get_today_schedule(db_path=DEFAULT_DB_PATH)
             t2 = time.perf_counter(); print(f"[perf] get_today_schedule: {t2-t1:.2f}s")
             crew_plan = proactive_crew_assignment(today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
@@ -1278,7 +1385,7 @@ with tab_forecast:
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Flights", len(today_flights))
-        c2.metric("High Risk", len(high), delta=f"{len(high)} need backup crew", delta_color="inverse" if high else "off")
+        c2.metric("High Risk", len(high), delta=f"{len(high)} {'needs' if len(high) == 1 else 'need'} backup crew", delta_color="inverse" if high else "off")
         c3.metric("Medium Risk", len(med), delta=f"{len(med)} on standby alert", delta_color="inverse" if med else "off")
         c4.metric("Low Risk", len(low))
 
@@ -1491,67 +1598,6 @@ with tab_forecast:
                 else:
                     st.metric(metric_label, metric_value)
 
-    with st.expander("Model Audit — Prediction vs Actual", expanded=False):
-        audit_days = st.slider("Audit period (days)", 7, 60, 14, key="audit_days")
-        audit_df = get_prediction_audit(days=audit_days, db_path=DEFAULT_DB_PATH)
-        if audit_df.empty:
-            st.info("No audited predictions yet. Run **Daily Briefing** to start logging predictions.")
-        else:
-            metrics = compute_audit_metrics(audit_df)
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Total Predictions", metrics["total"])
-            m2.metric("Accuracy", f"{metrics['accuracy']}%")
-            m3.metric("Precision", f"{metrics['precision']}%")
-            m4.metric("Recall", f"{metrics['recall']}%")
-            m5.metric("MAE", f"{metrics['mae']}min")
-
-            brier_col, f1_col = st.columns(2)
-            brier_col.metric("Brier Score", f"{metrics['brier_score']}", help="Lower is better (0 = perfect)")
-            f1_col.metric("F1 Score", f"{metrics['f1']}%")
-
-            if metrics.get("calibration"):
-                st.markdown("**Calibration — Predicted Probability vs Actual Delay Rate**")
-                cal_df = pd.DataFrame(metrics["calibration"])
-                cal_display = cal_df.rename(columns={
-                    "bucket": "Predicted Range",
-                    "predicted_avg": "Avg Predicted %",
-                    "actual_rate": "Actual Delay %",
-                    "count": "Flights",
-                })
-                st.dataframe(cal_display, hide_index=True, use_container_width=True)
-                st.bar_chart(cal_df.set_index("bucket")[["predicted_avg", "actual_rate"]])
-
-            if metrics.get("risk_distribution"):
-                st.markdown("**Risk Level Performance**")
-                risk_df = pd.DataFrame(metrics["risk_distribution"])
-                risk_display = risk_df.rename(columns={
-                    "risk_level": "Risk",
-                    "count": "Predictions",
-                    "actual_delay_rate": "Actual Delay %",
-                    "avg_predicted_prob": "Avg Predicted %",
-                    "avg_actual_delay_min": "Avg Actual Delay",
-                })
-                st.dataframe(risk_display, hide_index=True, use_container_width=True)
-
-            if metrics.get("predictions"):
-                st.markdown("**Recent Predictions**")
-                pred_df = pd.DataFrame(metrics["predictions"])
-                pred_display = pred_df.rename(columns={
-                    "date": "Date",
-                    "callsign": "Flight",
-                    "origin": "From",
-                    "destination": "To",
-                    "delay_probability": "Pred Prob",
-                    "risk_level": "Risk",
-                    "actual_delay_min": "Actual Delay",
-                    "actual_is_delayed": "Delayed?",
-                    "match": "Result",
-                })
-                pred_display["Pred Prob"] = pred_display["Pred Prob"].apply(lambda x: f"{x*100:.0f}%")
-                pred_display["Actual Delay"] = pred_display["Actual Delay"].apply(lambda x: f"{x:.0f}min" if pd.notna(x) else "—")
-                pred_display["Delayed?"] = pred_display["Delayed?"].apply(lambda x: "Yes" if x == 1 else "No")
-                st.dataframe(pred_display, hide_index=True, use_container_width=True)
-
 
 # ============================================================
 # TAB 4: LIVE TRACKING
@@ -1642,6 +1688,25 @@ with tab_live:
 # ============================================================
 # TAB 5: PLANNING (Advance Crew Allocation)
 # ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_planned_schedule(sel_date: str) -> list:
+    """Cached schedule + predictions for the Planning tab (1h TTL).
+
+    On the first (uncached) run, renders live progress in the UI and prints
+    stage-by-stage logs to the terminal; reruns within the TTL return instantly.
+    """
+    from datetime import date as _date_type
+    target = _date_type.fromisoformat(sel_date)
+    with st.status(f"Predicting delays for {sel_date}...", expanded=True) as status:
+        flights = get_schedule_for_date(
+            target,
+            db_path=DEFAULT_DB_PATH,
+            progress=lambda msg: status.update(label=msg),
+        )
+        status.update(label=f"Predicted {len(flights)} flights", state="complete")
+    return flights
+
+
 with tab_planning:
     from datetime import date as date_type
 
@@ -1650,40 +1715,53 @@ with tab_planning:
             actuals = get_flight_actuals_for_date(selected_date, db_path=DEFAULT_DB_PATH)
         st.divider()
         st.subheader(f"What Actually Happened — {selected_date}")
-        st.caption("Times are UTC. Scheduled = typical recurring departure (as shown across the app); Actual = ADS-B first/last seen (includes taxi-out, so small gaps are normal). "
-                   "Delayed = duration deviation beyond threshold, matching the rest of the app.")
+        st.caption("Times are UTC. Scheduled Dep/Arr = typical recurring times (Arr = Scheduled Dep + typical duration). Actual = ADS-B first/last seen (includes taxi-out, so small gaps are normal). "
+                   "Deviation = how late it actually landed vs Scheduled Arr; Delayed = landed more than 15 min after Scheduled Arr. "
+                   "Predicted Delayed = the model's binary call (delay probability >= its F1-optimal threshold) for that date; it is a forecast, so it need not match Status. "
+                   "Weather/Delay Cause = VOBL hourly conditions at departure/arrival (rain, thunder, fog, gusts >= 60 km/h, visibility < 4 km).")
         if not actuals:
             st.info("No flight data for this date.")
             return
         with_actual = [a for a in actuals if a["has_actual"]]
         delayed_rows = [a for a in with_actual if a["status"] == "Delayed"]
+        wx_delays = [a for a in delayed_rows if a.get("wx_adverse")]
         pred_high = [a for a in with_actual if a.get("predicted_risk") == "High"]
         pred_med = [a for a in with_actual if a.get("predicted_risk") == "Medium"]
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Flights Operated", len(with_actual))
         m2.metric("Delayed", len(delayed_rows), delta=f"{len(delayed_rows)/len(with_actual)*100:.0f}%" if with_actual else "0%",
                   delta_color="inverse" if delayed_rows else "off")
         m3.metric("Model High Risk", len(pred_high), delta_color="inverse" if pred_high else "off")
         m4.metric("Model Medium Risk", len(pred_med), delta_color="inverse" if pred_med else "off")
+        m5.metric("Weather Delays", len(wx_delays),
+                  delta=f"{len(wx_delays)/len(delayed_rows)*100:.0f}% of delays" if delayed_rows else "0%",
+                  delta_color="inverse" if wx_delays else "off")
 
         actual_rows = []
         for a in actuals:
+            delay_cause = "—"
+            if a["status"] == "Delayed":
+                delay_cause = "Weather" if a.get("wx_adverse") else "Non-weather"
             row = {
                 "Flight": a["callsign"],
                 "Route": a["route"],
                 "Scheduled Dep": a["scheduled_dep"] or "-",
                 "Actual Dep": a["actual_dep"] or "-",
+                "Scheduled Arr": a["scheduled_arr"] or "-",
                 "Actual Arr": a["actual_arr"] or "-",
                 "Expected Time": f"{a['expected_flight_min']:.0f}min" if a["expected_flight_min"] is not None else "-",
                 "Actual Time": f"{a['actual_flight_min']:.0f}min" if a["actual_flight_min"] is not None else "-",
-                "Deviation": f"{a['deviation_min']:+.1f}min" if a["deviation_min"] is not None else "-",
+                "Deviation": f"{a['arrival_deviation_min']:+.1f}min" if a["arrival_deviation_min"] is not None else "-",
+                "Weather": a.get("weather") or "-",
+                "Delay Cause": delay_cause,
                 "Status": a["status"],
             }
             if a.get("predicted_prob") is not None:
                 row["Predicted Prob"] = f"{a['predicted_prob']*100:.0f}%"
                 row["Predicted Delay"] = f"{a['predicted_delay_min']:.0f}min" if a["predicted_delay_min"] is not None else "-"
-                row["Actual Delay"] = f"{a['actual_delay_min']:+.1f}min" if a["actual_delay_min"] is not None else "-"
+                pred_del = a.get("predicted_delayed")
+                row["Predicted Delayed"] = "Yes" if pred_del else "No" if pred_del is not None else "-"
             actual_rows.append(row)
 
         actual_df = pd.DataFrame(actual_rows)
@@ -1692,6 +1770,11 @@ with tab_planning:
             else "color: #00b894; font-weight: bold" if v == "On time"
             else "",
             subset=["Status"],
+        ).map(
+            lambda v: "color: #d63031; font-weight: bold" if v == "Weather"
+            else "color: #7f8c8d; font-weight: bold" if v == "Non-weather"
+            else "",
+            subset=["Delay Cause"],
         )
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -1735,12 +1818,11 @@ with tab_planning:
         if is_past:
             _render_actuals(selected_date)
         else:
-            with st.spinner(f"Predicting delays for {selected_date}..."):
-                try:
-                    planned_flights = get_schedule_for_date(selected_date, db_path=DEFAULT_DB_PATH)
-                except Exception as e:
-                    st.error(f"Failed to generate schedule: {e}")
-                    planned_flights = []
+            try:
+                planned_flights = _load_planned_schedule(selected_date.isoformat())
+            except Exception as e:
+                st.error(f"Failed to generate schedule: {e}")
+                planned_flights = []
 
         if not is_past and planned_flights:
             high = [f for f in planned_flights if f["prediction"]["risk_level"] == "High"]
@@ -1749,7 +1831,7 @@ with tab_planning:
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total Flights", len(planned_flights))
-            c2.metric("High Risk", len(high), delta=f"{len(high)} need backup crew", delta_color="inverse" if high else "off")
+            c2.metric("High Risk", len(high), delta=f"{len(high)} {'needs' if len(high) == 1 else 'need'} backup crew", delta_color="inverse" if high else "off")
             c3.metric("Medium Risk", len(med), delta=f"{len(med)} on standby alert", delta_color="inverse" if med else "off")
             c4.metric("Low Risk", len(low))
 

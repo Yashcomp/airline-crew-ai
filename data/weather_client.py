@@ -241,7 +241,7 @@ def _cache_weather(records: List[Dict[str, Any]], db_path: Optional[Path] = None
                             (timestamp, temperature_c, wind_speed_kmh, wind_direction_deg,
                              visibility_m, cloud_cover_pct, cloud_cover_low_pct,
                              precipitation_mm, pressure_hpa, weather_code)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (
                                 r.get("timestamp"), r.get("temperature_c"), r.get("wind_speed_kmh"),
                                 r.get("wind_direction_deg"), r.get("visibility_m"),
@@ -262,6 +262,43 @@ def _cache_weather(records: List[Dict[str, Any]], db_path: Optional[Path] = None
             time.sleep(min(0.5 * (attempt + 1), 3))
 
 
+def get_daily_weather(
+    target_date,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Hourly weather for a date, using the DB cache when available.
+
+    Returns the cached records if ``weather_cache`` already has that date
+    (no network call); otherwise fetches forecast (future dates) or historical
+    (past/today) from Open-Meteo and stores it in the cache.
+    """
+    if hasattr(target_date, "strftime"):
+        dt = target_date
+    else:
+        dt = datetime.strptime(str(target_date), "%Y-%m-%d")
+    dt_str = dt.strftime("%Y-%m-%d")
+
+    cached = _get_cached_weather(dt_str, db_path)
+    if cached:
+        return cached
+
+    now = datetime.now(timezone.utc)
+    is_future = dt.date() > now.date()
+    records = []
+    try:
+        if is_future:
+            records = get_forecast_weather(dt_str, dt_str)
+        else:
+            records = get_historical_weather(dt_str, dt_str)
+            if not records:
+                records = get_forecast_weather(dt_str, dt_str)
+    except Exception:
+        records = []
+    if records:
+        _cache_weather(records, db_path)
+    return records
+
+
 def bulk_cache_weather(
     start_date: str,
     end_date: str,
@@ -273,6 +310,97 @@ def bulk_cache_weather(
     if records:
         _cache_weather(records, db_path)
     return len(records)
+
+
+_WMO_LABELS = {
+    0: "Clear",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Rime fog",
+    51: "Light drizzle",
+    53: "Drizzle",
+    55: "Dense drizzle",
+    56: "Freezing drizzle",
+    57: "Freezing drizzle",
+    61: "Light rain",
+    63: "Rain",
+    65: "Heavy rain",
+    66: "Freezing rain",
+    67: "Freezing rain",
+    71: "Light snow",
+    73: "Snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Rain showers",
+    81: "Rain showers",
+    82: "Violent showers",
+    85: "Snow showers",
+    86: "Snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm + hail",
+    99: "Thunderstorm + hail",
+}
+
+_ADVERSE_CODES = {
+    45, 48, 53, 55, 56, 57, 61, 63, 65, 66, 67,
+    71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99,
+}
+
+_ADVERSE_GUSTS_KMH = 60.0
+_ADVERSE_VIS_M = 4000.0
+_ADVERSE_PRECIP_MM = 0.5
+
+
+def weather_code_label(code: Optional[int]) -> str:
+    if code is None:
+        return "Unknown"
+    return _WMO_LABELS.get(int(code), f"Code {code}")
+
+
+def is_adverse_weather(rec: Optional[Dict[str, Any]]) -> bool:
+    """True when hourly conditions could plausibly delay operations at VOBL.
+
+    Adverse if measurable precipitation, rain/thunder/fog WMO code, strong
+    wind gusts, or low visibility. Excludes the near-daily light-drizzle (51)
+    so the tag stays discriminative.
+    """
+    if not rec:
+        return False
+    prec = rec.get("precipitation_mm") or 0
+    if prec > _ADVERSE_PRECIP_MM:
+        return True
+    code = rec.get("weather_code")
+    if code is not None and int(code) in _ADVERSE_CODES:
+        return True
+    gusts = rec.get("wind_gusts_kmh")
+    if gusts is not None and gusts >= _ADVERSE_GUSTS_KMH:
+        return True
+    vis = rec.get("visibility_m")
+    if vis is not None and vis > 0 and vis < _ADVERSE_VIS_M:
+        return True
+    return False
+
+
+def weather_summary(rec: Optional[Dict[str, Any]]) -> str:
+    """Short human-readable summary of hourly conditions, e.g. 'Rain, gusts 62 km/h'."""
+    if not rec:
+        return "-"
+    parts = []
+    code = rec.get("weather_code")
+    if code is not None:
+        parts.append(weather_code_label(code))
+    gusts = rec.get("wind_gusts_kmh")
+    if gusts is not None:
+        parts.append(f"gusts {gusts:.0f} km/h")
+    vis = rec.get("visibility_m")
+    if vis is not None and vis > 0 and vis < _ADVERSE_VIS_M:
+        parts.append(f"vis {vis / 1000.0:.1f} km")
+    prec = rec.get("precipitation_mm")
+    if prec is not None and prec > _ADVERSE_PRECIP_MM:
+        parts.append(f"{prec:.1f} mm")
+    return ", ".join(parts) if parts else "Clear"
 
 
 def kmh_to_knots(kmh: float) -> float:

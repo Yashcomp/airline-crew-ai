@@ -138,6 +138,11 @@ def _save_models(clf: XGBClassifier, reg: XGBRegressor, metadata: Dict[str, Any]
     _calibrator_cache = None
 
 
+def _save_metadata(metadata: Dict[str, Any]) -> None:
+    _ensure_models_dir()
+    joblib.dump(metadata, _MODEL_METADATA_PATH)
+
+
 def _load_metadata() -> Dict[str, Any]:
     if _MODEL_METADATA_PATH.exists():
         try:
@@ -145,6 +150,22 @@ def _load_metadata() -> Dict[str, Any]:
         except Exception:
             pass
     return {}
+
+
+def get_prediction_threshold() -> float:
+    """Single source of truth for the binary 'predicted delayed' threshold.
+
+    Returns the F1-optimal threshold fit on calibrated out-of-fold blended
+    scores at training time (stored in model metadata). Falls back to 0.30
+    when no model exists yet.
+    """
+    meta = _load_metadata()
+    ot = meta.get("optimal_threshold")
+    if isinstance(ot, dict):
+        t = ot.get("threshold")
+        if isinstance(t, (int, float)) and 0.0 <= t <= 1.0:
+            return float(t)
+    return 0.30
 
 
 def _load_calibrator():
@@ -708,13 +729,13 @@ def predict_delay(
     prob = result["delay_probability"]
     exp_delay = result["expected_delay_min"]
 
+    threshold = get_prediction_threshold()
+
+    risk_score = prob * exp_delay
     if departure_time is not None:
         medium_threshold = _RISK_MEDIUM_PROB_BY_DOW.get(departure_time.weekday(), _RISK_MEDIUM_PROB)
     else:
         medium_threshold = _RISK_MEDIUM_PROB
-    threshold = medium_threshold
-
-    risk_score = prob * exp_delay
     if prob >= _RISK_HIGH_PROB:
         risk_level = "High"
     elif prob >= medium_threshold:

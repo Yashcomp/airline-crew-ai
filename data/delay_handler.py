@@ -15,7 +15,7 @@ from data.models import Flight, Role
 from validators.dgca_validator import (
     check_crew_eligibility, full_compliance_check, compute_cost,
     MAX_DUTY_HOURS, MAX_ROLLING_7_DAY_HOURS, _limit,
-    GROUND_ROLES,
+    GROUND_ROLES, scenario_hours_for_role,
 )
 
 def _get_shift_for_hour(hour: int) -> str:
@@ -536,6 +536,7 @@ def proactive_crew_assignment(
         flight_hours = flight.get("avg_duration_min", 120) / 60.0
         delay_hours = exp_delay / 60.0 if exp_delay else 0
         dep_hour = flight.get("avg_departure_hour", 12)
+        eff_dep_hour = int(round(dep_hour + delay_hours))
         is_night = dep_hour < 6 or dep_hour >= 22
 
         existing_crew = get_crew_for_flight(fid, db_path) if db_path else []
@@ -556,9 +557,13 @@ def proactive_crew_assignment(
                     member = next((m for m in all_crew if m.crew_id.upper() == cid.upper()), None)
                     if not member:
                         continue
+                    if member.role in GROUND_ROLES and hasattr(member, 'shift') and member.shift:
+                        if not _is_shift_compatible(member.shift, eff_dep_hour):
+                            roles_needing_replacement[role_name] = cid
+                            break
                     result = check_crew_eligibility(
                         member,
-                        scenario_flight_hours=flight_hours + delay_hours,
+                        scenario_flight_hours=scenario_hours_for_role(member.role, flight_hours + delay_hours),
                         scenario_is_night_duty=is_night,
                     )
                     if not result.eligible:
@@ -589,11 +594,11 @@ def proactive_crew_assignment(
                 if member.current_duty_hours >= _limit(MAX_DUTY_HOURS, member.role) - 0.5:
                     continue
                 if member.role in GROUND_ROLES and hasattr(member, 'shift') and member.shift:
-                    if not _is_shift_compatible(member.shift, dep_hour):
+                    if not _is_shift_compatible(member.shift, eff_dep_hour):
                         continue
                 result = check_crew_eligibility(
                     member,
-                    scenario_flight_hours=flight_hours,
+                    scenario_flight_hours=scenario_hours_for_role(member.role, flight_hours),
                     scenario_is_night_duty=is_night,
                 )
                 if result.eligible:
@@ -664,4 +669,211 @@ def proactive_crew_assignment(
             "medium_risk_count": len(standby_alerts),
             "low_risk_count": len(today_schedule) - len(flights_needing_coverage) - len(standby_alerts),
         },
+    }
+
+
+def _find_eligible_standby_for_delay(
+    flight_id: str,
+    delay_minutes: int,
+    csv_path: str,
+    db_path: Optional[Path],
+    flight_info: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Delay-aware eligible standby scan for one flight.
+
+    Mirrors the briefing's own coverage logic (proactive_crew_assignment):
+    ground roles use scenario_hours_for_role and must match the shift of the
+    delay-adjusted departure hour. Eligible = legal, unassigned elsewhere,
+    DGCA-compliant under the delayed scenario.
+
+    ``flight_info`` is an optional schedule-derived dict (origin/destination/
+    expected_duration_min/avg_departure_hour) used as a fallback when the
+    flight has no rows in the flights table. Returns None when the flight
+    cannot be identified at all.
+    """
+    from data.flights_db import get_all_assignments
+    from data.staff_manager import REQUIRED_CREW  # noqa: F401 (validates roles exist)
+
+    flight = get_flight(flight_id, db_path)
+    if flight:
+        origin = flight.origin
+        destination = flight.destination
+        flight_hours = flight.flight_hours
+        dep_hour = flight.std.hour if flight.std else 12
+        assigned_ids = {a["crew_id"] for a in get_crew_for_flight(flight_id, db_path)}
+    elif flight_info:
+        origin = flight_info.get("origin") or "?"
+        destination = flight_info.get("destination") or "?"
+        flight_hours = (flight_info.get("expected_duration_min") or flight_info.get("flight_duration_min") or 0) / 60.0
+        dep_hour = int(flight_info.get("avg_departure_hour", 12))
+        assigned_ids = set()
+    else:
+        return None
+
+    all_crew = load_crew(csv_path)
+    delay_hours = delay_minutes / 60.0
+    eff_dep_hour = int(round(dep_hour + delay_hours))
+    is_night = dep_hour < 6 or dep_hour >= 22
+
+    busy_ids = set()
+    assignments = get_all_assignments(db_path) if db_path else []
+    for a in assignments:
+        if a.get("flight_id", "") != flight_id:
+            busy_ids.add(a.get("crew_id", ""))
+
+    eligible = []
+    for member in all_crew:
+        if member.crew_id in assigned_ids:
+            continue
+        if member.crew_id in busy_ids:
+            continue
+        if member.rest_status.lower() != "legal":
+            continue
+        if member.role in GROUND_ROLES and getattr(member, "shift", None):
+            if not _is_shift_compatible(member.shift, eff_dep_hour):
+                continue
+        result = check_crew_eligibility(
+            member,
+            scenario_flight_hours=scenario_hours_for_role(member.role, flight_hours + delay_hours),
+            scenario_is_night_duty=is_night,
+        )
+        if not result.eligible:
+            continue
+        scenario_hrs = scenario_hours_for_role(member.role, flight_hours)
+        eligible.append({
+            "crew_id": member.crew_id,
+            "name": member.name,
+            "role": member.role.value,
+            "current_duty_hours": member.current_duty_hours,
+            "rolling_7_day_hours": member.rolling_7_day_hours,
+            "rest_status": member.rest_status,
+            "cost": round(compute_cost(member, scenario_hrs), 2),
+            "qualifications": [q.aircraft_type for q in member.qualifications],
+        })
+
+    eligible.sort(key=lambda x: x["cost"])
+    return {
+        "eligible": eligible,
+        "origin": origin,
+        "destination": destination,
+        "assigned_count": len(assigned_ids),
+    }
+
+
+def assess_replacement_coverage(
+    flight_ids: List[str],
+    csv_path: str,
+    db_path: Optional[Path] = None,
+    delay_minutes: Optional[int] = None,
+    flight_map: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Check whether sufficient replacement (standby) crew exist for a set of flights.
+
+    Coverage mode (delay_minutes=None): can each flight be fully re-crewed from
+    the current eligible standby pool, by role? Also gives a pooled check so the
+    same standby crew member is not double-counted across flights.
+
+    Eligibility mode (delay_minutes set): returns the delay-aware per-role list of
+    who is eligible to cover each flight under that delay (per DGCA limits).
+
+    ``flight_map`` maps flight ID to a schedule-derived dict; used as a fallback
+    for flights present in the daily schedule but not in the flights table.
+
+    Returns a dict ready for UI rendering, e.g.:
+    {"status", "delay_minutes", "flights": [ {flight_id, route, assigned_count,
+      eligible_standby_count, role_verdict {role: {required, eligible, sufficient}},
+      sufficient, eligible_by_role {role: [crew...]}, delay_minutes } ],
+     "pooled": {role: {required, eligible_distinct, sufficient}},
+     "all_sufficient", "shortfalls", "total_flights", "required_per_flight"}
+    """
+    from data.staff_manager import REQUIRED_CREW
+
+    required_roles = list(REQUIRED_CREW.keys())
+    delay = delay_minutes if delay_minutes is not None else 0
+
+    results = []
+    pool_by_role: Dict[str, Dict[str, Any]] = {}
+    all_sufficient = True
+    shortfalls = []
+
+    for fid in flight_ids:
+        scan = _find_eligible_standby_for_delay(
+            fid, delay, csv_path, db_path,
+            flight_info=(flight_map or {}).get(fid),
+        )
+        if scan is None:
+            results.append({
+                "flight_id": fid,
+                "error": f"Flight {fid} not found.",
+                "sufficient": False,
+            })
+            all_sufficient = False
+            shortfalls.append(fid)
+            continue
+
+        eligible = scan["eligible"]
+
+        by_role: Dict[str, List[Dict[str, Any]]] = {}
+        for c in eligible:
+            by_role.setdefault(c.get("role", ""), []).append(c)
+
+        role_verdict = {}
+        for role_name in required_roles:
+            have = len(by_role.get(role_name, []))
+            need = REQUIRED_CREW.get(role_name, 0)
+            role_verdict[role_name] = {
+                "required": need,
+                "eligible": have,
+                "sufficient": have >= need,
+            }
+
+        flight_sufficient = all(v["sufficient"] for v in role_verdict.values())
+        if not flight_sufficient:
+            all_sufficient = False
+            missing_roles = [r for r, v in role_verdict.items() if not v["sufficient"]]
+            shortfalls.append(f"{fid} ({', '.join(missing_roles)})")
+
+        for role_name, lst in by_role.items():
+            bucket = pool_by_role.setdefault(role_name, {})
+            for c in lst:
+                bucket[c.get("crew_id")] = c
+
+        results.append({
+            "flight_id": fid,
+            "route": f"{scan['origin']} -> {scan['destination']}",
+            "assigned_count": scan["assigned_count"],
+            "eligible_standby_count": len(eligible),
+            "role_verdict": role_verdict,
+            "sufficient": flight_sufficient,
+            "eligible_by_role": by_role,
+            "delay_minutes": delay,
+        })
+
+    n_covered = len([r for r in results if "role_verdict" in r])
+    pooled_verdict = {}
+    for role_name in required_roles:
+        total_need = REQUIRED_CREW.get(role_name, 0) * n_covered
+        have = len(pool_by_role.get(role_name, {}))
+        pooled_verdict[role_name] = {
+            "required": total_need,
+            "eligible_distinct": have,
+            "sufficient": have >= total_need,
+        }
+    pooled_sufficient = all(v["sufficient"] for v in pooled_verdict.values())
+    if not pooled_sufficient:
+        for role_name, v in pooled_verdict.items():
+            if not v["sufficient"]:
+                shortfalls.append(
+                    f"shared pool {role_name}: need {v['required']}, only {v['eligible_distinct']} distinct eligible"
+                )
+
+    return {
+        "status": "success",
+        "delay_minutes": delay_minutes,
+        "flights": results,
+        "pooled": pooled_verdict,
+        "all_sufficient": all_sufficient and pooled_sufficient,
+        "shortfalls": shortfalls,
+        "total_flights": len(flight_ids),
+        "required_per_flight": REQUIRED_CREW,
     }
