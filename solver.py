@@ -21,19 +21,16 @@ from validators.dgca_validator import (
     ComplianceResult,
 )
 
+from app_config import (
+    SOLVER_SCENARIO_FLIGHT_HOURS,
+    SOLVER_SCENARIO_IS_NIGHT,
+    SOLVER_REQUIRED_COUNTS,
+)
+
 DEFAULT_CSV_PATH = Path(__file__).parent / "crew_standby_list.csv"
-DEFAULT_SCENARIO_FLIGHT_HOURS = 2.0
-DEFAULT_SCENARIO_IS_NIGHT = False
-DEFAULT_REQUIRED_COUNTS = {
-    Role.CAPTAIN.value: 1,
-    Role.FO.value: 1,
-    Role.CABIN_CREW.value: 2,
-    Role.RAMP_AGENT.value: 1,
-    Role.BAGGAGE_HANDLER.value: 1,
-    Role.CABIN_CLEANER.value: 1,
-    Role.CHECKIN_AGENT.value: 1,
-    Role.SECURITY_AGENT.value: 1,
-}
+DEFAULT_SCENARIO_FLIGHT_HOURS = SOLVER_SCENARIO_FLIGHT_HOURS
+DEFAULT_SCENARIO_IS_NIGHT = SOLVER_SCENARIO_IS_NIGHT
+DEFAULT_REQUIRED_COUNTS = dict(SOLVER_REQUIRED_COUNTS)
 
 
 def solve_from_csv(

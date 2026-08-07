@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,30 +26,255 @@ _CALIBRATOR_PATH = _MODELS_DIR / "delay_calibrator.pkl"
 _calibrator_cache: Optional[object] = None
 _models_cache: Optional[Tuple[Optional[XGBClassifier], Optional[XGBRegressor]]] = None
 
-_DELAY_THRESHOLD_MIN = 15.0
+from app_config import (
+    DELAY_THRESHOLD_MIN,
+    CORR_WINDOW_DAYS,
+    CORR_MIN_SAMPLES,
+    CORR_DEADBAND_PROB,
+    CORR_DEADBAND_MIN,
+    CORR_LEARNING_RATE,
+    CORR_MAX_LOGIT_BIAS,
+    CORR_MAX_MIN_BIAS,
+    CORR_CACHE_TTL_S,
+    WEEKDAY_WEIGHT_DEFAULT,
+    WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE,
+    RISK_HIGH_PROB,
+    RISK_MEDIUM_PROB,
+    RISK_MEDIUM_PROB_BY_DOW,
+    WEATHER_BASELINE,
+    PREDICT_BLEND_WEIGHT,
+)
 
-WEEKDAY_WEIGHT_DEFAULT = 0.75
-_WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE = 8
-
-_RISK_HIGH_PROB = 0.37
-_RISK_MEDIUM_PROB = 0.30
-_RISK_MEDIUM_PROB_BY_DOW = {
-    0: 0.30,  # Mon
-    1: 0.32,  # Tue
-    2: 0.28,  # Wed
-    3: 0.28,  # Thu
-    4: 0.30,  # Fri
-    5: 0.30,  # Sat
-    6: 0.32,  # Sun
-}
+# Keep local aliases so existing call sites and internal references are unchanged.
+_DELAY_THRESHOLD_MIN = DELAY_THRESHOLD_MIN
+_CORR_WINDOW_DAYS = CORR_WINDOW_DAYS
+_CORR_MIN_SAMPLES = CORR_MIN_SAMPLES
+_CORR_DEADBAND_PROB = CORR_DEADBAND_PROB
+_CORR_DEADBAND_MIN = CORR_DEADBAND_MIN
+_CORR_LEARNING_RATE = CORR_LEARNING_RATE
+_CORR_MAX_LOGIT_BIAS = CORR_MAX_LOGIT_BIAS
+_CORR_MAX_MIN_BIAS = CORR_MAX_MIN_BIAS
+_CORR_CACHE_TTL_S = CORR_CACHE_TTL_S
+_WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE = WEEKDAY_SAMPLE_FOR_FULL_CONFIDENCE
+_RISK_HIGH_PROB = RISK_HIGH_PROB
+_RISK_MEDIUM_PROB = RISK_MEDIUM_PROB
+_RISK_MEDIUM_PROB_BY_DOW = dict(RISK_MEDIUM_PROB_BY_DOW)
 _RISK_FLAG_THRESHOLD = _RISK_MEDIUM_PROB
+_WEATHER_BASELINE = WEATHER_BASELINE
 
-_WEATHER_BASELINE = {
-    "wind_kmh": 21.0,
-    "precip_mm": 0.1,
-    "vis_m": 10000.0,
-    "cloud_pct": 88.5,
-}
+_correction_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _resolve_correction_db_path(db_path: Optional[Path] = None) -> Optional[Path]:
+    if db_path is not None:
+        return db_path
+    try:
+        from data.opensky_db import DEFAULT_DB_PATH
+        return DEFAULT_DB_PATH
+    except Exception:
+        return None
+
+
+def _load_route_correction(route: str, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    path = _resolve_correction_db_path(db_path)
+    if path is None:
+        return {}
+    now = time.time()
+    cached = _correction_cache.get(route)
+    if cached and now - cached.get("_ts", 0) < _CORR_CACHE_TTL_S:
+        return cached
+    row = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            r = conn.execute(
+                "SELECT logit_bias, minutes_bias FROM prediction_correction WHERE route = ?",
+                (route,),
+            ).fetchone()
+            if r:
+                row = {
+                    "logit_bias": float(r["logit_bias"] or 0.0),
+                    "minutes_bias": float(r["minutes_bias"] or 0.0),
+                }
+        finally:
+            conn.close()
+    except Exception:
+        row = {}
+    row["_ts"] = now
+    _correction_cache[route] = row
+    return row
+
+
+def _invalidate_correction_cache() -> None:
+    _correction_cache.clear()
+
+
+def apply_online_correction(
+    prob: float,
+    expected_min: float,
+    route: str,
+    db_path: Optional[Path] = None,
+) -> tuple:
+    """Apply the per-route online bias to a raw (prob, expected_min) pair.
+
+    prob  -> sigmoid(logit(prob) + logit_bias)
+    minutes -> expected_min + minutes_bias (floor 0)
+    """
+    corr = _load_route_correction(route, db_path=db_path)
+    logit_bias = float(corr.get("logit_bias", 0.0))
+    minutes_bias = float(corr.get("minutes_bias", 0.0))
+    if logit_bias == 0.0 and minutes_bias == 0.0:
+        return prob, expected_min
+    if logit_bias != 0.0:
+        p = max(1e-6, min(1.0 - 1e-6, float(prob)))
+        logit = np.log(p / (1.0 - p)) + logit_bias
+        prob = 1.0 / (1.0 + np.exp(-logit))
+    prob = min(0.95, max(0.05, prob))
+    minutes = max(0.0, float(expected_min) + minutes_bias)
+    return prob, minutes
+
+
+def update_online_correction(
+    db_path: Optional[Path] = None,
+    window_days: int = _CORR_WINDOW_DAYS,
+) -> Dict[str, Any]:
+    """Recompute per-route correction biases from recent prediction-vs-actual drift.
+
+    Reads prediction_log rows whose outcome has been recorded (actual_is_delayed
+    NOT NULL) within the window, groups by origin_destination, and for each route
+    with >= min samples and drift beyond the deadband moves the bias a fraction
+    (learning rate) of the way toward the target. Nothing happens for routes
+    that are within the deadband, so small noise does not cause constant drift.
+    """
+    import sqlite3
+
+    path = _resolve_correction_db_path(db_path)
+    if path is None or not Path(str(path)).exists():
+        return {"status": "no_db", "routes_adjusted": 0}
+    rows = []
+    try:
+        conn = sqlite3.connect(str(path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """SELECT origin, destination, delay_probability, expected_delay_min,
+                          actual_is_delayed, actual_delay_min
+                   FROM prediction_log
+                   WHERE actual_is_delayed IS NOT NULL
+                     AND date >= date('now', ?)""",
+                (f"-{int(window_days)} days",),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return {"status": "error", "routes_adjusted": 0}
+
+    grouped: Dict[str, List[tuple]] = {}
+    for r in rows:
+        origin = (r["origin"] or "").strip()
+        destination = (r["destination"] or "").strip()
+        if not origin or not destination:
+            continue
+        route = f"{origin}_{destination}"
+        prob = r["delay_probability"]
+        expected = r["expected_delay_min"]
+        if prob is None:
+            continue
+        actual_delay = 1 if r["actual_is_delayed"] else 0
+        actual_min = r["actual_delay_min"] if r["actual_delay_min"] is not None else 0.0
+        grouped.setdefault(route, []).append(
+            (float(prob), float(expected or 0.0), actual_delay, float(actual_min))
+        )
+
+    adjusted = []
+    for route, items in grouped.items():
+        n = len(items)
+        if n < _CORR_MIN_SAMPLES:
+            continue
+        mean_prob = sum(x[0] for x in items) / n
+        mean_exp = sum(x[1] for x in items) / n
+        actual_rate = sum(x[2] for x in items) / n
+        actual_mean_min = sum(x[3] for x in items) / n
+        prob_drift = actual_rate - mean_prob
+        min_drift = actual_mean_min - mean_exp
+
+        new_logit_bias = 0.0
+        new_min_bias = 0.0
+        if abs(prob_drift) > _CORR_DEADBAND_PROB:
+            target = min(0.95, max(0.05, actual_rate))
+            target_logit = np.log(target / (1.0 - target))
+            current_logit = np.log(max(1e-6, min(1.0 - 1e-6, mean_prob)) / (1.0 - max(1e-6, min(1.0 - 1e-6, mean_prob))))
+            new_logit_bias = (_CORR_LEARNING_RATE * (target_logit - current_logit))
+        if abs(min_drift) > _CORR_DEADBAND_MIN:
+            new_min_bias = _CORR_LEARNING_RATE * min_drift
+
+        if new_logit_bias == 0.0 and new_min_bias == 0.0:
+            continue
+        new_logit_bias = max(-_CORR_MAX_LOGIT_BIAS, min(_CORR_MAX_LOGIT_BIAS, new_logit_bias))
+        new_min_bias = max(-_CORR_MAX_MIN_BIAS, min(_CORR_MAX_MIN_BIAS, new_min_bias))
+        residual = prob_drift if abs(prob_drift) > abs(min_drift) / 100.0 else min_drift
+        try:
+            conn = sqlite3.connect(str(path), timeout=5)
+            try:
+                conn.execute(
+                    """INSERT INTO prediction_correction
+                       (route, logit_bias, minutes_bias, sample_count, last_residual, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(route) DO UPDATE SET
+                         logit_bias = prediction_correction.logit_bias + excluded.logit_bias,
+                         minutes_bias = prediction_correction.minutes_bias + excluded.minutes_bias,
+                         sample_count = excluded.sample_count,
+                         last_residual = excluded.last_residual,
+                         updated_at = excluded.updated_at""",
+                    (
+                        route, round(new_logit_bias, 4), round(new_min_bias, 4),
+                        n, round(prob_drift, 4),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        adjusted.append({
+            "route": route, "samples": n, "prob_drift": round(prob_drift, 4),
+            "min_drift": round(min_drift, 1),
+            "logit_bias_delta": round(new_logit_bias, 4),
+            "minutes_bias_delta": round(new_min_bias, 4),
+        })
+
+    _invalidate_correction_cache()
+    return {
+        "status": "success",
+        "routes_with_actuals": len(grouped),
+        "routes_adjusted": len(adjusted),
+        "window_days": int(window_days),
+        "adjustments": adjusted,
+    }
+
+
+def _reset_online_corrections(db_path: Optional[Path] = None) -> None:
+    """Zero out all correction biases (called after a full model retrain)."""
+    import sqlite3
+
+    path = _resolve_correction_db_path(db_path)
+    if path is None:
+        return
+    try:
+        conn = sqlite3.connect(str(path), timeout=5)
+        try:
+            conn.execute("DELETE FROM prediction_correction")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    _invalidate_correction_cache()
+
+
 
 
 def _compute_weather_adjustment(
@@ -205,6 +430,35 @@ def _best_delay_threshold(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, 
                 "recall": round(float(recall_score(y_true, pred, zero_division=0)), 4),
             }
     return best
+
+
+def _register_model_run(metadata: Dict[str, Any], db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Snapshot the active artifacts under a version id and log the run.
+
+    Called after a successful training run so the model can be rolled back via
+    data.opensky_db.activate_model_version. Failures here never block training.
+    """
+    try:
+        from data.opensky_db import register_model_run
+    except Exception:
+        return {"status": "skipped"}
+    version = "v" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    artifact_files: Dict[str, str] = {}
+    for fname in ("delay_classifier.pkl", "delay_regressor.pkl", "delay_calibrator.pkl", "model_metadata.pkl"):
+        src = _MODELS_DIR / fname
+        if not src.exists():
+            continue
+        snap = f"{Path(fname).stem}_{version}.pkl"
+        try:
+            import shutil
+            shutil.copy2(str(src), str(_MODELS_DIR / snap))
+            artifact_files[fname] = snap
+        except Exception:
+            pass
+    try:
+        return register_model_run(version, metadata, artifact_files, db_path=db_path)
+    except Exception:
+        return {"status": "error"}
 
 
 def train_model(
@@ -467,6 +721,8 @@ def train_model(
     }
 
     _save_models(clf_final, reg_final, metadata)
+    _reset_online_corrections(db_path)
+    _register_model_run(metadata, db_path)
 
     cv_acc = avg_clf.get("accuracy", 0)
     cv_f1 = avg_clf.get("f1", 0)
@@ -652,9 +908,12 @@ def predict_delay(
     route_hour_delay_rate: float = 0.0,
     route_delay_rate: float = 0.0,
     callsign_delay_rate: float = 0.0,
+    db_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     if departure_time is None:
         departure_time = datetime.now()
+
+    route = f"{origin}_{destination}"
 
     wind_speed_kmh = float(wind_speed_kmh or 0)
     wind_gusts_kmh = float(wind_gusts_kmh or 0)
@@ -668,7 +927,7 @@ def predict_delay(
         hour_of_day=departure_hour,
         day_of_week=departure_time.weekday(),
         month=departure_time.month,
-        route=f"{origin}_{destination}",
+        route=route,
         prev_delay=prev_flight_delay,
         wind_speed_kmh=wind_speed_kmh,
         wind_gusts_kmh=wind_gusts_kmh,
@@ -704,7 +963,7 @@ def predict_delay(
     )
 
     meta = _load_metadata()
-    blend_w = 0.7
+    blend_w = PREDICT_BLEND_WEIGHT
     if meta:
         bw = meta.get("blend_weight")
         if isinstance(bw, (int, float)) and 0 <= bw <= 1:
@@ -725,6 +984,12 @@ def predict_delay(
     adjusted_prob = max(0.05, min(0.95, blended + weather_adj["probability_boost"]))
     result["delay_probability"] = round(adjusted_prob, 3)
     result["expected_delay_min"] = round(adjusted_prob * cond_magnitude + weather_adj["delay_boost"], 1)
+
+    corrected_prob, corrected_min = apply_online_correction(
+        result["delay_probability"], result["expected_delay_min"], route, db_path=db_path
+    )
+    result["delay_probability"] = round(corrected_prob, 3)
+    result["expected_delay_min"] = round(corrected_min, 1)
 
     prob = result["delay_probability"]
     exp_delay = result["expected_delay_min"]

@@ -344,12 +344,6 @@ GRD402,Krishna Sharma,CheckinAgent,7.8,17.0,0,Legal,45.9,1.5,B737;A320,BLR,1,0.0
 GRD403,Aadhya Joshi,SecurityAgent,8.9,11.3,1,Legal,40.4,1.5,B737;A320,BLR,1,0.0,4,2,Night
 GRD404,Sai Rao,SecurityAgent,0.9,0.4,0,Legal,38.7,1.5,B737;A320,BLR,1,0.0,7,1,Night
 GRD405,Krishna Malhotra,SecurityAgent,7.1,11.5,1,Legal,40.2,1.5,B737;A320,BLR,1,0.0,1,5,Night
-STBY-6E69F0,Standby BaggageHandler,BaggageHandler,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,
-STBY-EB0D53,Standby CabinCleaner,CabinCleaner,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,
-STBY-F4C498,Standby CheckinAgent,CheckinAgent,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,
-STBY-A9AF9D,Standby SecurityAgent,SecurityAgent,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,
-STBY-B81D69,Standby RampAgent,RampAgent,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,
-STBY-C6E9F1,Standby SecurityAgent,SecurityAgent,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,
 CRW300,Aarav Mehta,Captain,0,0,0,Legal,134.4,1.0,B737;A320;A321,VOBL,0,0,7,0,
 CRW301,Priya Nair,Captain,0,0,0,Legal,134.4,1.0,B737;A320;A321,VOBL,0,0,7,0,
 CRW302,Rohan Iyer,BaggageHandler,0,0,0,Legal,1.0,1.0,,VOBL,0,0,7,0,

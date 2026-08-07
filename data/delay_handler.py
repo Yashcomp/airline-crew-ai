@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -436,73 +435,6 @@ def process_delay_with_replacements(
     }
 
 
-def _ensure_standby(
-    eligible_standby: List[Dict[str, Any]],
-    roles_needing_replacement: Dict[str, Optional[str]],
-    csv_path: str,
-) -> List[Dict[str, Any]]:
-    missing = []
-    for role_name in roles_needing_replacement:
-        has = any(c.get("role") == role_name for c in eligible_standby)
-        if not has:
-            missing.append(role_name)
-
-    if not missing:
-        return eligible_standby
-
-    new_rows = []
-    for role_name in missing:
-        suffix = uuid.uuid4().hex[:6].upper()
-        cid = f"STBY-{suffix}"
-        synthetic = {
-            "crew_id": cid,
-            "name": f"Standby {role_name}",
-            "role": role_name,
-            "current_duty_hours": 0,
-            "rolling_7_day_hours": 0,
-            "consecutive_night_shifts": 0,
-            "rest_status": "Legal",
-            "base_cost": 1.0,
-            "overtime_multiplier": 1.0,
-            "qualifications": "",
-            "base_airport": "VOBL",
-            "seniority": 0,
-            "hours_flown_30_days": 0,
-            "days_since_rest": 7,
-            "consecutive_days_on": 0,
-            "shift": "",
-        }
-        new_rows.append(synthetic)
-        eligible_standby.append({
-            "crew_id": cid,
-            "name": synthetic["name"],
-            "role": role_name,
-            "cost": 0,
-            "rest_status": "Legal",
-            "current_duty_hours": 0,
-            "rolling_7_day_hours": 0,
-            "tier": 99,
-            "assigned_flight": "",
-        })
-
-    try:
-        path = Path(csv_path)
-        with path.open("a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "crew_id", "name", "role", "current_duty_hours",
-                "rolling_7_day_hours", "consecutive_night_shifts",
-                "rest_status", "base_cost", "overtime_multiplier",
-                "qualifications", "base_airport", "seniority",
-                "hours_flown_30_days", "days_since_rest",
-                "consecutive_days_on", "shift",
-            ])
-            writer.writerows(new_rows)
-    except Exception:
-        pass
-
-    return eligible_standby
-
-
 def proactive_crew_assignment(
     today_schedule: List[Dict[str, Any]],
     csv_path: str,
@@ -547,28 +479,33 @@ def proactive_crew_assignment(
                 existing_by_role[r] = []
             existing_by_role[r].append(ac["crew_id"])
 
-        roles_needing_replacement: Dict[str, Optional[str]] = {}
-        for role_name, count_needed in REQUIRED_CREW.items():
-            assigned_ids = existing_by_role.get(role_name, [])
-            if not assigned_ids:
-                roles_needing_replacement[role_name] = None
-            elif risk in ("High", "Medium"):
-                for cid in assigned_ids:
+        roles_needing_replacement: Dict[str, List[str]] = {}
+        replacement_reasons: Dict[str, str] = {}
+        if risk in ("High", "Medium"):
+            for role_name in REQUIRED_CREW:
+                to_replace = []
+                for cid in existing_by_role.get(role_name, []):
                     member = next((m for m in all_crew if m.crew_id.upper() == cid.upper()), None)
                     if not member:
                         continue
                     if member.role in GROUND_ROLES and hasattr(member, 'shift') and member.shift:
                         if not _is_shift_compatible(member.shift, eff_dep_hour):
-                            roles_needing_replacement[role_name] = cid
-                            break
+                            to_replace.append(cid)
+                            replacement_reasons[cid] = (
+                                f"shift {member.shift} incompatible with {eff_dep_hour}:00 departure"
+                            )
+                            continue
                     result = check_crew_eligibility(
                         member,
                         scenario_flight_hours=scenario_hours_for_role(member.role, flight_hours + delay_hours),
                         scenario_is_night_duty=is_night,
                     )
                     if not result.eligible:
-                        roles_needing_replacement[role_name] = cid
-                        break
+                        to_replace.append(cid)
+                        reasons = result.violations if result.violations else ["fails DGCA compliance under predicted delay"]
+                        replacement_reasons[cid] = "; ".join(reasons[:2])
+                if to_replace:
+                    roles_needing_replacement[role_name] = to_replace
 
         eligible_standby = []
         if risk in ("High", "Medium"):
@@ -598,7 +535,7 @@ def proactive_crew_assignment(
                         continue
                 result = check_crew_eligibility(
                     member,
-                    scenario_flight_hours=scenario_hours_for_role(member.role, flight_hours),
+                    scenario_flight_hours=scenario_hours_for_role(member.role, flight_hours + delay_hours),
                     scenario_is_night_duty=is_night,
                 )
                 if result.eligible:
@@ -615,16 +552,18 @@ def proactive_crew_assignment(
                         "assigned_flight": assigned_flight,
                     })
 
-            eligible_standby = _ensure_standby(eligible_standby, roles_needing_replacement, csv_path)
             eligible_standby.sort(key=lambda x: (x["tier"], x["cost"]))
 
         suggestions = {}
-        for role_name, old_cid in roles_needing_replacement.items():
+        for role_name, need_entries in roles_needing_replacement.items():
             candidates = [c for c in eligible_standby if c.get("role") == role_name]
-            if candidates:
-                best = candidates[0]
+            if not candidates:
+                continue
+            role_suggestions = []
+            for old_cid in need_entries[:len(candidates)]:
+                best = candidates[len(role_suggestions)]
                 old_crew_member = next((m for m in all_crew if m.crew_id.upper() == (old_cid or "").upper()), None)
-                suggestions[role_name] = {
+                role_suggestions.append({
                     "crew_id": best["crew_id"],
                     "name": best["name"],
                     "cost": best["cost"],
@@ -635,7 +574,15 @@ def proactive_crew_assignment(
                     "assigned_flight": best["assigned_flight"],
                     "old_crew_id": old_cid,
                     "old_crew_name": old_crew_member.name if old_crew_member else None,
-                }
+                    "reason": replacement_reasons.get(old_cid, ""),
+                })
+            if role_suggestions:
+                suggestions[role_name] = role_suggestions
+
+        no_standby_roles = sorted(
+            rn for rn, need_entries in roles_needing_replacement.items()
+            if not any(c.get("role") == rn for c in eligible_standby)
+        )
 
         rec = {
             "flight_id": fid,
@@ -647,6 +594,12 @@ def proactive_crew_assignment(
             "expected_delay_min": exp_delay,
             "factors": pred.get("factors", []),
             "suggested_crew": suggestions,
+            "no_standby_roles": no_standby_roles,
+            "understaffed_roles": {
+                role_name: count_needed - len(existing_by_role.get(role_name, []))
+                for role_name, count_needed in REQUIRED_CREW.items()
+                if count_needed - len(existing_by_role.get(role_name, [])) > 0
+            },
             "standby_count": len(eligible_standby),
             "leg_type": flight.get("leg_type", "First Leg"),
             "crew_action": flight.get("crew_action", ""),

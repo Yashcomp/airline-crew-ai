@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -9,6 +10,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
+from logging_setup import configure_logging
 
 from rag_engine import retrieve_legal_guidance
 from router import route_request, _is_plain_greeting, is_meta_question, _extract_date
@@ -39,6 +42,24 @@ APP_TITLE = "Airline Crew Operations Hub"
 DEFAULT_CSV_PATH = Path(__file__).parent / "crew_standby_list.csv"
 DEFAULT_DB_PATH = Path(__file__).parent / "data" / "flights.db"
 
+logger = logging.getLogger(__name__)
+configure_logging()
+
+_PLANE_ENTITY_HTML = """
+<div class="plane-entity" aria-hidden="true">
+  <span class="contrail"></span>
+  <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <path d="M21 16v-2l-8-5V3.5C13 2.67 12.33 2 11.5 2S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V21l3-.5 3 .5v-1.5L12 19v-5.5l8 2.5z" fill="#f9a825"/>
+  </svg>
+</div>
+"""
+_LOOP_PLANE_HTML = f"""
+<div class="plane-scene loop-plane" aria-hidden="true">{_PLANE_ENTITY_HTML}</div>
+"""
+_BRIEFING_PLANE_HTML = f"""
+<div class="plane-scene briefing-plane" aria-hidden="true">{_PLANE_ENTITY_HTML}</div>
+"""
+
 
 def _get_crew_shift_lookup(csv_path=None):
     path = csv_path or str(DEFAULT_CSV_PATH)
@@ -48,6 +69,8 @@ def _get_crew_shift_lookup(csv_path=None):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption("Flight scheduling, crew management, DGCA compliance, and disruption recovery — all in one place.")
+
+st.markdown(_LOOP_PLANE_HTML, unsafe_allow_html=True)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -385,6 +408,13 @@ st.markdown(
     """
     <style>
     [data-testid='stChatMessage']{scroll-margin-bottom:6.5rem}
+    .plane-scene{position:relative;width:100%;height:0;overflow:visible;pointer-events:none;z-index:999}
+    .plane-entity{position:absolute;top:0;left:0;display:flex;flex-direction:row;align-items:center;gap:2px;white-space:nowrap}
+    .plane-entity .contrail{width:44px;height:3px;border-radius:3px;background:repeating-linear-gradient(90deg,rgba(120,144,156,.6) 0 5px,transparent 5px 10px)}
+    .plane-entity svg{transform:rotate(90deg);filter:drop-shadow(0 2px 3px rgba(0,0,0,.45)) drop-shadow(0 0 6px rgba(249,168,37,.55))}
+    .loop-plane .plane-entity{animation:flyAcross 18s linear infinite}
+    .briefing-plane .plane-entity{animation:flyAcross 4.5s linear infinite}
+    @keyframes flyAcross{0%{transform:translateX(-14vw) translateY(0)}25%{transform:translateX(22vw) translateY(-4px)}50%{transform:translateX(46vw) translateY(0)}75%{transform:translateX(72vw) translateY(-4px)}100%{transform:translateX(112vw) translateY(0)}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -1318,6 +1348,7 @@ with tab_forecast:
 
     if st.button("Run Daily Briefing", type="primary",
                  help="Seeds recent data, auto-trains the model if more than 24h since the last briefing, predicts delays, suggests crew."):
+        st.markdown(_BRIEFING_PLANE_HTML, unsafe_allow_html=True)
         with st.spinner("Running Daily Briefing — updating data, predicting delays, assigning crew..."):
             t0 = time.perf_counter()
             last_brief = get_last_briefing_time(DEFAULT_DB_PATH)
@@ -1334,22 +1365,25 @@ with tab_forecast:
                     days_back = 1
                     retrain = False
             update_result = update_daily_data(days_back=days_back, db_path=DEFAULT_DB_PATH, retrain=retrain)
-            t1 = time.perf_counter(); print(f"[perf] update_daily_data: {t1-t0:.2f}s")
+            t1 = time.perf_counter(); logger.info(f"[perf] update_daily_data: {t1-t0:.2f}s")
             sync_result = sync_opensky_flights_to_db(
                 csv_path=str(DEFAULT_CSV_PATH), db_path=DEFAULT_DB_PATH
             )
-            t1b = time.perf_counter(); print(f"[perf] sync_opensky_flights_to_db: {t1b-t1:.2f}s")
+            t1b = time.perf_counter(); logger.info(f"[perf] sync_opensky_flights_to_db: {t1b-t1:.2f}s")
             today_flights = get_today_schedule(db_path=DEFAULT_DB_PATH)
-            t2 = time.perf_counter(); print(f"[perf] get_today_schedule: {t2-t1:.2f}s")
+            t2 = time.perf_counter(); logger.info(f"[perf] get_today_schedule: {t2-t1:.2f}s")
             crew_plan = proactive_crew_assignment(today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
-            t3 = time.perf_counter(); print(f"[perf] proactive_crew_assignment: {t3-t2:.2f}s")
+            t3 = time.perf_counter(); logger.info(f"[perf] proactive_crew_assignment: {t3-t2:.2f}s")
             at_risk = get_at_risk_crew(str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH)
-            t4 = time.perf_counter(); print(f"[perf] get_at_risk_crew: {t4-t3:.2f}s")
+            t4 = time.perf_counter(); logger.info(f"[perf] get_at_risk_crew: {t4-t3:.2f}s")
             log_predictions(today_flights, DEFAULT_DB_PATH)
-            t5 = time.perf_counter(); print(f"[perf] log_predictions: {t5-t4:.2f}s")
+            t5 = time.perf_counter(); logger.info(f"[perf] log_predictions: {t5-t4:.2f}s")
             update_actuals(DEFAULT_DB_PATH)
-            t6 = time.perf_counter(); print(f"[perf] update_actuals: {t6-t5:.2f}s")
-            print(f"[perf] TOTAL briefing: {t6-t0:.2f}s")
+            t6 = time.perf_counter(); logger.info(f"[perf] update_actuals: {t6-t5:.2f}s")
+            from ml_engine.delay_predictor import update_online_correction
+            corr_result = update_online_correction(db_path=DEFAULT_DB_PATH)
+            t6b = time.perf_counter(); logger.info(f"[perf] update_online_correction: {t6b-t6:.2f}s ({corr_result.get('routes_adjusted', 0)} routes adjusted)")
+            logger.info(f"[perf] TOTAL briefing: {t6b-t0:.2f}s")
             model_status = update_result.get("model", {}).get("status", "skipped")
             if retrain:
                 st.session_state["briefing_status"] = (
@@ -1360,6 +1394,8 @@ with tab_forecast:
         st.session_state["today_flights"] = today_flights
         st.session_state["crew_plan"] = crew_plan
         st.session_state["at_risk_crew"] = at_risk
+        st.session_state["replacement_msg"] = ""
+        st.rerun()
 
     today_flights = st.session_state.get("today_flights", [])
     crew_plan = st.session_state.get("crew_plan", {})
@@ -1414,6 +1450,8 @@ with tab_forecast:
                 fid = f["callsign"]
                 rec = recs.get(fid, {})
                 suggestions = rec.get("suggested_crew", {})
+                replacement_msg = st.session_state.get("replacement_msg", "")
+                msg_for_this_flight = bool(replacement_msg) and replacement_msg.get("flight_id") == fid
                 leg_type = f.get("leg_type", "First Leg")
                 crew_action = f.get("crew_action", "")
 
@@ -1440,87 +1478,100 @@ with tab_forecast:
                     _hist_count = f.get("dow_sample_count") or f["total_flights"]
                     col_hist.caption(f"Weekday history ({_dow_name}): {f['delay_rate_pct']}% delayed, avg deviation {f['avg_deviation_min']}min across {_hist_count} {_dow_name}s")
 
-                    if suggestions:
+                    no_standby_roles = rec.get("no_standby_roles", [])
+                    needs_plan = bool(suggestions) or bool(no_standby_roles)
+
+                    if needs_plan:
                         replacement_lines = []
-                        for role_name, sug in suggestions.items():
-                            old_cid = sug.get("old_crew_id")
-                            old_name = sug.get("old_crew_name")
-                            if not old_cid or not old_name:
-                                current_crew = get_crew_for_flight(fid, DEFAULT_DB_PATH)
-                                current_by_role = {}
-                                for ac in current_crew:
-                                    r = ac.get("role", "")
-                                    if r not in current_by_role:
-                                        current_by_role[r] = []
-                                    current_by_role[r].append(ac)
-                                holders = current_by_role.get(role_name, [])
-                                old_cid = holders[0]["crew_id"] if holders else None
-                                old_name = crew_name_map.get(old_cid, old_cid) if old_cid else "(unassigned)"
-                            replacement_lines.append(f"**{role_name}**: {old_name} → **{sug['name']}** ({sug['crew_id']})")
+                        for role_name, sug_list in suggestions.items():
+                            for sug in sug_list:
+                                old_cid = sug.get("old_crew_id")
+                                old_name = sug.get("old_crew_name")
+                                if old_cid and not old_name:
+                                    old_name = crew_name_map.get(old_cid, old_cid)
+                                if not old_name:
+                                    old_name = "(unassigned)"
+                                reason = sug.get("reason", "")
+                                reason_txt = f" — {reason}" if reason else ""
+                                replacement_lines.append(
+                                    f"**{role_name}**: {old_name} ({old_cid}){reason_txt} → **{sug['name']}** ({sug['crew_id']})"
+                                )
+                        for role_name in no_standby_roles:
+                            replacement_lines.append(f"**{role_name}**: no eligible standby crew available for replacement")
 
                         if replacement_lines:
-                            with st.expander(f"Replacement plan for **{fid}**", expanded=False):
+                            with st.expander(f"Predicted DGCA violations → standby replacements — **{fid}**", expanded=True):
                                 for line in replacement_lines:
                                     st.markdown(f"• {line}")
 
-                        n_roles = len(suggestions)
-                        btn_label = f"Replace {n_roles} crew on {fid}" if n_roles > 1 else f"Replace crew on {fid}"
-                        if st.button(btn_label, key=f"assign_{fid}"):
-                            assigned_any = False
-                            already_assigned_count = 0
-                            failed_count = 0
-                            reassigned_count = 0
-                            replaced_count = 0
-                            for role_name, sug in suggestions.items():
-                                old_cid = sug.get("old_crew_id")
-                                if old_cid:
-                                    unassign_crew_from_flight(old_cid, fid, DEFAULT_DB_PATH)
-                                    replaced_count += 1
-                                role_count = sum(1 for a in get_crew_for_flight(fid, DEFAULT_DB_PATH) if a["role"] == role_name)
-                                if role_count >= REQUIRED_CREW.get(role_name, 0):
-                                    already_assigned_count += 1
-                                    continue
-                                old_flight = sug.get("assigned_flight", "")
-                                if old_flight:
-                                    unassign_crew_from_flight(sug["crew_id"], old_flight, DEFAULT_DB_PATH)
-                                    reassigned_count += 1
-                                ar = assign_crew_to_flight(sug["crew_id"], fid, role_name, DEFAULT_DB_PATH)
-                                if ar.get("status") == "success":
-                                    assigned_any = True
-                                elif "already assigned" in ar.get("message", "").lower():
-                                    already_assigned_count += 1
+                        n_roles = sum(len(v) for v in suggestions.values())
+                        if n_roles:
+                            btn_label = f"Replace {n_roles} crew on {fid}" if n_roles > 1 else f"Replace crew on {fid}"
+                            if st.button(btn_label, key=f"assign_{fid}"):
+                                assigned_any = False
+                                already_assigned_count = 0
+                                failed_count = 0
+                                reassigned_count = 0
+                                replaced_count = 0
+                                for role_name, sug_list in suggestions.items():
+                                    for sug in sug_list:
+                                        old_cid = sug.get("old_crew_id")
+                                        if old_cid:
+                                            unassign_crew_from_flight(old_cid, fid, DEFAULT_DB_PATH)
+                                            replaced_count += 1
+                                        role_count = sum(1 for a in get_crew_for_flight(fid, DEFAULT_DB_PATH) if a["role"] == role_name)
+                                        if role_count >= REQUIRED_CREW.get(role_name, 0):
+                                            already_assigned_count += 1
+                                            continue
+                                        old_flight = sug.get("assigned_flight", "")
+                                        if old_flight:
+                                            unassign_crew_from_flight(sug["crew_id"], old_flight, DEFAULT_DB_PATH)
+                                            reassigned_count += 1
+                                        ar = assign_crew_to_flight(sug["crew_id"], fid, role_name, DEFAULT_DB_PATH)
+                                        if ar.get("status") == "success":
+                                            assigned_any = True
+                                        elif "already assigned" in ar.get("message", "").lower():
+                                            already_assigned_count += 1
+                                        else:
+                                            failed_count += 1
+                                if assigned_any:
+                                    msg_lines = list(replacement_lines)
+                                    msg = "\n".join(msg_lines)
+                                    extra = []
+                                    if replaced_count:
+                                        extra.append(f"{replaced_count} old crew removed from {fid}")
+                                    if reassigned_count:
+                                        extra.append(f"{reassigned_count} reassigned from other flights")
+                                    if extra:
+                                        msg += "\n\n(" + ", ".join(extra) + ")"
+                                    st.session_state["replacement_msg"] = {"flight_id": fid, "type": "success", "text": msg}
+                                    st.session_state["crew_plan"] = proactive_crew_assignment(
+                                        today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH
+                                    )
+                                    st.rerun()
+                                elif already_assigned_count > 0:
+                                    st.warning(f"{already_assigned_count} crew already assigned to {fid}. Check if backup is actually needed.")
                                 else:
-                                    failed_count += 1
-                            if assigned_any:
-                                msg_lines = [f"**{fid}** crew updated:"]
-                                for line in replacement_lines:
-                                    msg_lines.append(f"• {line}")
-                                msg = "\n".join(msg_lines)
-                                extra = []
-                                if replaced_count:
-                                    extra.append(f"{replaced_count} old crew removed from {fid}")
-                                if reassigned_count:
-                                    extra.append(f"{reassigned_count} reassigned from other flights")
-                                if extra:
-                                    msg += "\n\n(" + ", ".join(extra) + ")"
-                                st.success(msg)
-                                st.session_state["crew_plan"] = proactive_crew_assignment(
-                                    today_flights, str(DEFAULT_CSV_PATH), DEFAULT_DB_PATH
-                                )
-                                st.rerun()
-                            elif already_assigned_count > 0:
-                                st.warning(f"{already_assigned_count} crew already assigned to {fid}. Check if backup is actually needed.")
-                            else:
-                                st.error(f"Assignment failed for {failed_count} crew. They may have DGCA violations.")
-                    elif fid in recs:
-                        standby_count = rec.get("standby_count", 0)
-                        if pred["risk_level"] in ("High", "Medium"):
+                                    st.error(f"Assignment failed for {failed_count} crew. They may have DGCA violations.")
+                    elif fid in recs and not msg_for_this_flight:
+                        missing_roles = rec.get("understaffed_roles", {})
+                        if missing_roles:
+                            missing_desc = ", ".join(
+                                f"{v} {k}" + ("s" if v > 1 else "") for k, v in missing_roles.items()
+                            )
+                            st.warning(f"Short-staffed: missing {missing_desc}. No eligible roster staff available to backfill.")
+                        elif pred["risk_level"] in ("High", "Medium"):
+                            standby_count = rec.get("standby_count", 0)
                             if standby_count > 0:
                                 st.success(f"Crew is DGCA-compliant. **{standby_count}** standby crew available as backup.")
                             else:
                                 st.warning("No DGCA-compliant standby crew available for this flight.")
                         else:
                             st.info("Crew is DGCA-compliant. No changes needed.")
+
+                    if msg_for_this_flight:
+                        body = "\n".join(f"• {line}" for line in replacement_msg["text"].split("\n"))
+                        st.success(body)
 
                     st.divider()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import bisect
 import csv
 import json
+import logging
 import sqlite3
 import statistics
 import time
@@ -19,6 +20,8 @@ from data.weather_client import (
     _get_cached_weather, init_weather_table, kmh_to_knots,
     get_daily_weather, is_adverse_weather, weather_summary,
 )
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_DB_PATH = Path(__file__).parent / "flights.db"
@@ -160,6 +163,36 @@ def init_opensky_tables(db_path: Optional[Path] = None) -> None:
             actual_is_delayed INTEGER,
             actual_recorded_at TEXT,
             UNIQUE(callsign, origin, destination, date)
+        );
+
+        CREATE TABLE IF NOT EXISTS prediction_correction (
+            route TEXT PRIMARY KEY,
+            logit_bias REAL NOT NULL DEFAULT 0,
+            minutes_bias REAL NOT NULL DEFAULT 0,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            last_residual REAL NOT NULL DEFAULT 0,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS model_registry (
+            version TEXT PRIMARY KEY,
+            trained_at TEXT,
+            status TEXT DEFAULT 'archived',
+            samples INTEGER,
+            train_samples INTEGER,
+            test_samples INTEGER,
+            delay_rate REAL,
+            n_routes INTEGER,
+            cv_accuracy REAL,
+            cv_f1 REAL,
+            cv_roc_auc REAL,
+            cv_mae REAL,
+            cv_rmse REAL,
+            optimal_threshold REAL,
+            blend_weight REAL,
+            feature_importance TEXT,
+            artifact_files TEXT,
+            notes TEXT
         );
 
         CREATE TABLE IF NOT EXISTS prediction_cache (
@@ -1597,7 +1630,7 @@ def get_schedule_for_date(
     _t_start = time.time()
 
     def _log(stage: str, msg: str) -> None:
-        print(f"[schedule] {stage}: {msg} ({time.time() - _t_start:.1f}s)", flush=True)
+        logger.debug(f"[schedule] {stage}: {msg} ({time.time() - _t_start:.1f}s)")
 
     if progress:
         progress(f"Loading flight schedule for {dt_str}")
@@ -2046,7 +2079,12 @@ def sync_opensky_flights_to_db(
 
     path = db_path or DEFAULT_DB_PATH
     today = datetime.now()
-    schedule = get_flight_schedule(limit=SCHEDULE_LIMIT, db_path=path)
+    today_utc = datetime.now(timezone.utc).date()
+    schedule = get_flight_schedule(
+        limit=SCHEDULE_LIMIT, db_path=path,
+        day_of_week=today_utc.weekday(),
+        reference_date=today_utc.strftime("%Y-%m-%d"),
+    )
     if not schedule:
         return {"inserted": 0, "assigned": 0, "message": "No flights in schedule."}
 
@@ -2531,3 +2569,153 @@ def compute_audit_metrics(audit_df: pd.DataFrame) -> Dict[str, Any]:
                                   "risk_level", "predicted_delayed", "actual_delay_min",
                                   "actual_is_delayed", "match"]].to_dict("records"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Model registry: logs every training run and lets you roll back to a past one.
+# ---------------------------------------------------------------------------
+
+_MODEL_ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "ml_engine" / "models"
+
+
+def register_model_run(
+    version: str,
+    metadata: Dict[str, Any],
+    artifact_files: Dict[str, str],
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Record a completed training run as the active model.
+
+    ``version`` is a short unique id (e.g. "v20260807_094518"); ``metadata`` is the
+    model metadata dict produced by train_model; ``artifact_files`` maps each active
+    artifact filename to the versioned snapshot filename saved alongside it.
+    """
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return {"status": "no_db", "version": version}
+
+    ot = metadata.get("optimal_threshold")
+    ot_val = ot.get("threshold") if isinstance(ot, dict) else ot
+
+    def _write():
+        conn = _connect_write(path)
+        try:
+            conn.execute("UPDATE model_registry SET status = 'archived' WHERE status = 'active'")
+            conn.execute(
+                """INSERT OR REPLACE INTO model_registry
+                   (version, trained_at, status, samples, train_samples, test_samples,
+                    delay_rate, n_routes, cv_accuracy, cv_f1, cv_roc_auc, cv_mae, cv_rmse,
+                    optimal_threshold, blend_weight, feature_importance, artifact_files, notes)
+                   VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    version,
+                    metadata.get("trained_at"),
+                    metadata.get("samples"),
+                    metadata.get("train_samples"),
+                    metadata.get("test_samples"),
+                    metadata.get("delay_rate"),
+                    metadata.get("n_routes"),
+                    metadata.get("cv_accuracy"),
+                    metadata.get("cv_f1"),
+                    metadata.get("cv_roc_auc"),
+                    metadata.get("cv_mae"),
+                    metadata.get("cv_rmse"),
+                    ot_val,
+                    metadata.get("blend_weight"),
+                    json.dumps(metadata.get("feature_importance") or {}, default=str),
+                    json.dumps(artifact_files, default=str),
+                    metadata.get("message"),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_on_lock(_write)
+    return {"status": "registered", "version": version}
+
+
+def get_model_history(db_path: Optional[Path] = None) -> pd.DataFrame:
+    """All recorded training runs, newest first."""
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return pd.DataFrame()
+    init_opensky_tables(path)
+    conn = _connect(path)
+    try:
+        return pd.read_sql_query(
+            """SELECT version, trained_at, status, samples, train_samples, test_samples,
+                      delay_rate, n_routes, cv_accuracy, cv_f1, cv_roc_auc, cv_mae, cv_rmse,
+                      optimal_threshold, blend_weight, notes
+               FROM model_registry
+               ORDER BY trained_at DESC""",
+            conn,
+        )
+    except sqlite3.OperationalError:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+def activate_model_version(version: str, db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Roll back to a previously trained model version.
+
+    Copies that version's snapshot artifacts back over the active model files and
+    marks it the active registry row. In-memory model caches are invalidated so the
+    next prediction loads the restored artifacts.
+    """
+    import shutil
+
+    path = db_path or DEFAULT_DB_PATH
+    if not path.exists():
+        return {"status": "no_db", "version": version}
+    init_opensky_tables(path)
+
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT artifact_files FROM model_registry WHERE version = ?",
+            (version,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["artifact_files"]:
+        return {"status": "not_found", "version": version}
+    try:
+        files = json.loads(row["artifact_files"])
+    except Exception:
+        return {"status": "error", "version": version}
+
+    restored = []
+    for logical, snapshot in files.items():
+        src = _MODEL_ARTIFACT_DIR / snapshot
+        if not src.exists():
+            continue
+        dst = _MODEL_ARTIFACT_DIR / logical
+        try:
+            shutil.copy2(str(src), str(dst))
+            restored.append(snapshot)
+        except Exception:
+            pass
+    if not restored:
+        return {"status": "error", "version": version}
+
+    try:
+        from ml_engine import delay_predictor as _dp
+        _dp._models_cache = None
+        _dp._calibrator_cache = None
+    except Exception:
+        pass
+
+    def _write():
+        conn = _connect_write(path)
+        try:
+            conn.execute("UPDATE model_registry SET status = 'archived'")
+            conn.execute("UPDATE model_registry SET status = 'active' WHERE version = ?", (version,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_on_lock(_write)
+    return {"status": "activated", "version": version, "restored": restored}
+
